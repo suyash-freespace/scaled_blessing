@@ -411,8 +411,7 @@ function decodeFaults(verdict) {
   if (!verdict) return ['no verdict'];
   const w = parseInt(verdict, 16) >>> 0;              // >>> 0 keeps it unsigned
   if ((w & 0xFF000000) >>> 0 !== 0xD5000000) {
-    if (w === 1 || w === 2) return ['legacy code, no detail'];
-    return ['not a verdict'];
+    return ['not a verdict'];                         // includes pre-coded 1 and 2
   }
   const bits = w & 0xFFFF;
   if (bits === 0) return [];                          // pass
@@ -630,9 +629,15 @@ STM32_Programmer_CLI.exe -c port=SWD freq=24000 mode=HOTPLUG sn=<probe> -r8 0x08
 | Value | Meaning |
 |-------|---------|
 | `0x00000000` | DUT has not finished |
-| `0x00000001` | PASS |
-| `0x00000002` | FAIL |
+| `0xD5000000` | PASS — signature present, no fault bits |
+| `0xD50000NN` | FAIL — stage-1 hardware faults in the low byte |
+| `0xD500NN00` | FAIL — stage-2 link faults in the second byte |
+| `0x00000001`, `0x00000002` | Pre-coded pass/fail. **Not accepted**, reflash the device |
 | `0x00005776` | Not the verdict — SBSFU's `FLOW_CTRL_INIT_VALUE`, i.e. it has not handed over yet |
+
+The fault bits are `0x0001` PIR, `0x0002` SPI flash, `0x0004` KTD I2C and `0x0100` OTAA
+join. See `confluence_dut_error_codes.md` for the full list and for what each fault does
+and does not prove.
 
 `g_u32DutResult` lives in its own `.dut_result` section at the very start of the
 application RAM region, pinned by `ide/STM32WL55JCIX_FLASH.ld`. Two hard constraints:

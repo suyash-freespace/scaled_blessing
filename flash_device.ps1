@@ -129,9 +129,10 @@ $VERDICT_FAULT_NAMES = @(
 function Test-VerdictWord {
     <# True when the word is a verdict rather than stale RAM or a mid-run read. #>
     param([uint32]$Word)
-    # Legacy 1/2 stay readable for one release, so a bench still holding pre-coded
-    # firmware reports pass/fail instead of a verdict timeout.
-    if ($Word -eq 1 -or $Word -eq 2) { return $true }
+    # The signature is the only thing that makes a word a verdict. The pre-coded 1 and 2
+    # are NOT accepted: that firmware is not going to production, so a board still
+    # holding it must report a verdict timeout rather than a pass or a fault name. The
+    # timeout path names 1 and 2 explicitly, so the operator is told to reflash.
     return ((($Word -band $VERDICT_SIGNATURE_MASK) -eq $VERDICT_SIGNATURE) -and
             (($Word -band $VERDICT_RESERVED_MASK) -eq 0))
 }
@@ -140,10 +141,8 @@ function Get-VerdictDetail {
     <# Decode a verdict word into pass/fail plus the named faults. #>
     param([uint32]$Word)
 
-    # Same shape on every path, so callers can read .Note unconditionally.
-    if ($Word -eq 1) { return [pscustomobject]@{ Passed = $true;  Faults = @(); Legacy = $true; Note = '' } }
-    if ($Word -eq 2) { return [pscustomobject]@{ Passed = $false; Faults = @(); Legacy = $true; Note = 'no fault detail: pre-coded firmware' } }
-
+    # Only ever called with a word Test-VerdictWord accepted, so the signature is
+    # present and pass/fail is the fault bits alone.
     $bits = $Word -band $VERDICT_FAULT_MASK
     $faults = New-Object System.Collections.Generic.List[string]
     $named = 0L
@@ -165,7 +164,6 @@ function Get-VerdictDetail {
     return [pscustomobject]@{
         Passed = ($bits -eq 0)
         Faults = $faults.ToArray()
-        Legacy = $false
         Note   = $note
     }
 }
@@ -372,9 +370,9 @@ try {
     # ---- 5. verdict (opt-in) ------------------------------------------------
     # HOTPLUG only: any reset runs SBSFU, whose .data starts at exactly 0x20003400,
     # so it would overwrite the verdict before the app ever gets to write it.
-    # Only a word Test-VerdictWord accepts ends the wait - a signed 0xD5?????? code,
-    # or a legacy 0x01/0x02. 0x00000000 means the DUT is still running, and
-    # 0x00005776 (FLOW_CTRL_INIT_VALUE) means SBSFU has not handed over yet.
+    # Only a word Test-VerdictWord accepts ends the wait - a signed 0xD5?????? code.
+    # 0x00000000 means the DUT is still running, and 0x00005776 (FLOW_CTRL_INIT_VALUE)
+    # means SBSFU has not handed over yet.
     Write-Status -Step 'WAIT_VERDICT' -Message 'device running DUT; polling verdict word'
     $deadline = (Get-Date).AddSeconds($VerdictTimeoutSec)
     $verdict = $null
@@ -398,6 +396,13 @@ try {
         $seen = 'no successful read'
         if ($null -ne $last) { $seen = '0x{0:X8}' -f $last }
         "VERDICT TIMEOUT after ${VerdictTimeoutSec}s (last read $seen)"
+        # 1 and 2 are the pre-coded pass/fail values. They are no longer accepted as a
+        # verdict, so name them here: the device booted and finished its DUT, but the
+        # image on it predates the coded scheme and has to be replaced.
+        if ($last -eq 1 -or $last -eq 2) {
+            "  that is a pre-coded verdict, which this rig no longer accepts - reflash with a"
+            "  build that writes the 0xD5 coded word, then bless again"
+        }
         Complete-Run -Code 5 -Step 'WAIT_VERDICT' -State 'error' `
             -Message "no verdict within ${VerdictTimeoutSec}s (last read $seen)"
     }
@@ -408,7 +413,6 @@ try {
 
     if ($detail.Passed) {
         "VERDICT PASS  verdict=$hex"
-        if ($detail.Legacy) { "  legacy pass code - this device predates the coded verdict" }
         Complete-Run -Code 0 -Step 'DONE' -State 'passed' -Message "DUT PASS ($hex)"
     }
 
@@ -420,9 +424,6 @@ try {
     if ($detail.Faults -contains 'OTAA join') {
         "  a mass erase forces a fresh join, so a gateway must be reachable and the"
         "  AppKey/JoinEUI must already be registered against this DevEUI."
-    }
-    if ($detail.Legacy) {
-        "  pre-coded firmware reports pass/fail only; reflash to get per-part codes."
     }
     Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex): $what"
 }

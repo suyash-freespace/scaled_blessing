@@ -131,16 +131,19 @@ The rig will see these at `0x20003400`. None of them is a fault code.
 |-------|---------|
 | `0x00000000` | DUT still running, or the word was just cleared. Keep polling. |
 | `0x00005776` | SBSFU's `uFlowCryptoValue` (`FLOW_CTRL_INIT_VALUE`). SBSFU has not handed over yet. |
-| `0x00000001` | **Legacy pass.** Firmware built before the coded scheme. |
-| `0x00000002` | **Legacy fail.** No fault detail available. |
+| `0x00000001` | **Pre-coded pass.** Firmware built before the coded scheme. Not accepted. |
+| `0x00000002` | **Pre-coded fail.** Not accepted. |
 | anything else with a high byte that is not `0xD5` | Stale RAM. Not a verdict. |
 
 A signed code carrying a bit the rig has no name for is reported as
 `unknown fault bits 0xNNNN` and counts as a **fail**. That is deliberate: newer
 firmware read by an older rig must fail loudly rather than pass a board silently.
 
-Keep decoding legacy `1` and `2` for one release. A bench holding older boards then
-still reads a result instead of reporting a verdict timeout.
+The pre-coded `1` and `2` are **not** decoded. Only the `0xD5` signature makes a word a
+verdict, so a board still holding a pre-coded image runs to `VERDICT TIMEOUT` (exit 5).
+The timeout output names the value and tells the operator to reflash. Reason: those
+builds are bench-only and are not going to production, and `1` and `2` are ambiguous
+against any future scheme that uses small integers.
 
 ---
 

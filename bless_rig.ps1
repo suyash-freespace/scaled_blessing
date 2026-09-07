@@ -648,17 +648,18 @@ $summary = @(foreach ($p in $plan) {
     }
     elseif ($verdict) {
         # No exit code, but a verdict was logged. Decode it the same way
-        # flash_device.ps1 does: the signature plus zero fault bits is a pass, and
-        # legacy 0x00000001 stays a pass for pre-coded firmware.
+        # flash_device.ps1 does: the signature plus zero fault bits is a pass. The
+        # pre-coded 1 and 2 are not verdicts any more, so they fall through to
+        # "unrecognised" instead of being reported as a pass or a fail.
         # L suffixes required: a bare 0xD5000000 is a negative Int32 in Windows
         # PowerShell and never matches a real uint32 word. See flash_device.ps1.
         $v = [Convert]::ToUInt32($verdict, 16)
         $signed = ((($v -band 0xFF000000L) -eq 0xD5000000L) -and (($v -band 0x00FF0000L) -eq 0))
-        if ($v -eq 1 -or ($signed -and ($v -band 0x0000FFFFL) -eq 0)) {
+        if ($signed -and ($v -band 0x0000FFFFL) -eq 0) {
             $meaning = 'PASS (from log; no exit code)'
             $passed = $true
         }
-        elseif ($v -eq 2 -or $signed) {
+        elseif ($signed) {
             $meaning = 'DUT FAIL (from log; no exit code)'
         }
         else {
