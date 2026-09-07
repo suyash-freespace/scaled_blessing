@@ -63,7 +63,7 @@
 
 .NOTES
     Exit codes: 0 = every device PASSed (or, with -NoWait, all processes launched)
-                1 = setup/validation error
+                1 = setup/validation error - reason on stderr, stdout empty under -Json
                 2 = at least one device did not PASS
 #>
 [CmdletBinding()]
@@ -163,6 +163,10 @@ param(
     # Check the exit code BEFORE parsing. A setup or validation error (exit 1) fails
     # before any station runs, so there is no result to report and stdout is empty.
     # Exit 0 and exit 2 both emit the document.
+    #
+    # On exit 1, read STDERR for the reason: the refusal is written there as plain
+    # lines, one per problem, e.g. "AppKey is identical on stations 2, 4". Capture it -
+    # discarding stderr turns every validation failure into a bare exit 1.
     [switch]$Json,
 
     [switch]$DryRun
@@ -173,12 +177,37 @@ $ErrorActionPreference = 'Stop'
 
 if ($Json) {
     # Silence every human-facing line from one place. A script-scope function shadows
-    # the Write-Host cmdlet, so all 38 call sites go quiet without touching any of
-    # them. Declared with no param block on purpose: a simple function swallows any
+    # the Write-Host cmdlet, so every call site goes quiet without touching any of
+    # them. Refusals are exempt - they go through Write-Diag below, to stderr, because a
+    # run that cannot start must still say why.
+    #
+    # Declared with no param block on purpose: a simple function swallows any
     # arguments, including -ForegroundColor, where an advanced one would reject them.
     # The Format-Table calls write to the success stream instead and are gated
     # separately, at each call site.
     function Write-Host { }
+}
+
+# Setup/validation diagnostics, for the lines that decide the run cannot start.
+#
+# These must survive -Json. Write-Host is a no-op there, so routing a refusal through
+# it left the caller with exit 1, an empty stdout and no idea what was wrong - a
+# duplicate AppKey and an unreadable device list looked identical. stderr is the right
+# channel: stdout stays a single parse-able document, and the reason travels with it.
+#
+# [Console]::Error rather than Write-Error on purpose - Write-Error decorates the text
+# with the exception, the call site and a stack position, which the caller would have
+# to strip to recover one sentence.
+function Write-Diag {
+    param(
+        [string[]]$Lines,
+        [ValidateSet('Red', 'Yellow')]
+        [string]$Colour = 'Red'
+    )
+    foreach ($line in $Lines) {
+        if ($Json) { [Console]::Error.WriteLine($line) }
+        else { Write-Host $line -ForegroundColor $Colour }
+    }
 }
 
 # Canonical station -> op-code map, shared with flash_device.ps1. Defines
@@ -220,8 +249,8 @@ if (($cols -notcontains 'Position') -and ($cols -notcontains 'OpCode')) {
     $problems += "need a 'Position' column (1-6, preferred) or an explicit 'OpCode' column (found: $($cols -join ', '))"
 }
 if ($problems.Count -gt 0) {
-    Write-Host "Device list is not usable:" -ForegroundColor Red
-    $problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    Write-Diag "Device list is not usable:"
+    Write-Diag @($problems | ForEach-Object { "  - $_" })
     exit 1
 }
 
@@ -278,8 +307,8 @@ foreach ($dup in ($rows | Group-Object OpCode | Where-Object { $_.Count -gt 1 })
 }
 
 if ($problems.Count -gt 0) {
-    Write-Host "Device list is not usable:" -ForegroundColor Red
-    $problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    Write-Diag "Device list is not usable:"
+    Write-Diag @($problems | ForEach-Object { "  - $_" })
     exit 1
 }
 
@@ -299,16 +328,16 @@ if ($PSBoundParameters.ContainsKey('Stations') -and $Stations) {
         else { $bad += $tok }
     }
     if ($bad.Count -gt 0) {
-        Write-Host ("Bad -Stations value(s): {0}. Valid stations are {1}." -f `
-            ($bad -join ', '), ($VALID_STATIONS -join ', ')) -ForegroundColor Red
+        Write-Diag ("Bad -Stations value(s): {0}. Valid stations are {1}." -f `
+            ($bad -join ', '), ($VALID_STATIONS -join ', '))
         exit 1
     }
 
     $available = @($rows | ForEach-Object { [Convert]::ToInt32($_.OpCode, 16) -band 0x0F })
     $missing = @($wanted | Where-Object { $available -notcontains $_ })
     if ($missing.Count -gt 0) {
-        Write-Host ("Device list has no row for station(s): {0}. It defines stations: {1}." -f `
-            ($missing -join ', '), (($available | Sort-Object) -join ', ')) -ForegroundColor Red
+        Write-Diag ("Device list has no row for station(s): {0}. It defines stations: {1}." -f `
+            ($missing -join ', '), (($available | Sort-Object) -join ', '))
         exit 1
     }
 
@@ -359,14 +388,14 @@ if ($Keys) {
     }
 
     if ($problems.Count -gt 0) {
-        Write-Host "Key allocation is not usable:" -ForegroundColor Red
-        $problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+        Write-Diag "Key allocation is not usable:"
+        Write-Diag @($problems | ForEach-Object { "  - $_" })
         exit 1
     }
 
     $noKeys = @($selected | Where-Object { -not $stationKeys.ContainsKey($_) } | Sort-Object)
     if ($noKeys.Count -gt 0) {
-        Write-Host ("WARNING: no keys given for station(s) $($noKeys -join ', ') - they will be blessed with the SHARED bring-up AppKey" -f '') -ForegroundColor Yellow
+        Write-Diag -Colour Yellow ("WARNING: no keys given for station(s) $($noKeys -join ', ') - they will be blessed with the SHARED bring-up AppKey")
     }
 }
 
