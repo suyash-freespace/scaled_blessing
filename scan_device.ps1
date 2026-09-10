@@ -11,14 +11,15 @@
 
         1. Ask STM32_Programmer_CLI which ST-LINK probes are attached.
         2. Map each probe serial to its rig station, using rig_devices.csv.
-        3. Read each attached device's DevEUI via flash_device.ps1 -ReadDevEuiOnly.
+        3. Read each attached device's chip UID directly and derive its DevEUI.
 
     The DevEUI comes from the chip UID, not from the factory page. So the rig has to read
-    it off the device. flash_device.ps1 already mirrors GetUniqueId()'s byte order, and
-    this script calls it rather than reimplementing that order and getting it subtly
-    wrong.
+    it off the device. The byte order mirrors GetUniqueId() in
+    common/board/src/sys_app.c - the same logic flash_device.ps1 uses, copied in rather
+    than called out to, so a scan never spawns a child powershell.exe/flash_device.ps1
+    process per station. All CLI calls (-l and the UID reads) run with -q.
 
-    Nothing here writes to a device. -ReadDevEuiOnly returns before the erase step, so a
+    Nothing here writes to a device. The UID read happens before any erase step, so a
     scan is safe on an already blessed device, at any time.
 
     The State column reports every mismatch between the bench and the device list:
@@ -41,9 +42,9 @@
     Emit the rows as JSON instead of a table, for the blessing service to consume.
 
 .EXAMPLE
-    .\scan_rig.ps1
-    .\scan_rig.ps1 -Stations 1,3
-    .\scan_rig.ps1 -Json | ConvertFrom-Json
+    .\scan_device.ps1
+    .\scan_device.ps1 -Stations 1,3
+    .\scan_device.ps1 -Json | ConvertFrom-Json
 
 .NOTES
     Exit codes: 0 = every listed station answered | 1 = setup error
@@ -76,9 +77,12 @@ $ErrorActionPreference = 'Stop'
 # for $VALID_STATIONS.
 . (Join-Path $PSScriptRoot 'rig_layout.ps1')
 
-$deviceScript = Join-Path $PSScriptRoot 'flash_device.ps1'
-if (-not (Test-Path $deviceScript)) { throw "flash_device.ps1 not found next to this script: $deviceScript" }
 if (-not (Test-Path $ProgrammerCli)) { throw "STM32_Programmer_CLI not found: $ProgrammerCli" }
+
+# Chip UID, read directly in this process - no child powershell.exe/flash_device.ps1
+# spawn per station. Same register and byte order as GetUniqueId() in
+# common/board/src/sys_app.c / flash_device.ps1, kept in step with both by hand.
+$UID64 = 0x1FFF7580
 if (-not $DeviceList) { $DeviceList = Join-Path $PSScriptRoot 'rig_devices.csv' }
 
 function Get-AttachedProbe {
@@ -89,7 +93,9 @@ function Get-AttachedProbe {
       under "STLink Interface" and again in its serial-port section, so a raw parse
       reports two probes for one board and then scans it twice.
     #>
-    $out = @(& $ProgrammerCli -l)
+    # -q (quiet) drops the CLI's banner/progress output, which is pure render/flush
+    # overhead here - the SN lines this function parses still print with -q on.
+    $out = @(& $ProgrammerCli -q -l)
     if ($LASTEXITCODE -ne 0) { throw "STM32_Programmer_CLI -l failed (exit $LASTEXITCODE)" }
     $serials = New-Object System.Collections.Generic.List[string]
     foreach ($line in $out) {
@@ -108,40 +114,79 @@ function Get-AttachedProbe {
     return $serials.ToArray()
 }
 
+function Read-Words {
+    <#
+      Read $Count 32-bit words at $Address over SWD, in THIS process - the same CLI
+      call flash_device.ps1's Read-Words makes, copied rather than shared so this
+      script has no dependency on that file. -q strips the banner; the "0xADDR :
+      <words>" lines this parses still print with it on.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][uint32]$Address,
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][string]$SerialNumber
+    )
+    $c = "port=SWD freq=$Freq mode=HOTPLUG sn=$SerialNumber"
+    $out = & $ProgrammerCli -q -c $c.Split(' ') -r32 ('0x{0:X8}' -f $Address) ($Count * 4)
+    if ($LASTEXITCODE -ne 0) { throw "read at 0x{0:X8} failed (exit $LASTEXITCODE)" -f $Address }
+    $w = New-Object System.Collections.Generic.List[uint32]
+    foreach ($l in $out) {
+        if ($l -match '^\s*0x[0-9A-Fa-f]+\s*:\s*(.+)$') {
+            foreach ($t in ($Matches[1] -split '\s+')) {
+                if ($t -match '^[0-9A-Fa-f]{8}$') { $w.Add([Convert]::ToUInt32($t, 16)) }
+            }
+        }
+    }
+    if ($w.Count -lt $Count) { throw ("expected $Count word(s) at 0x{0:X8}, parsed $($w.Count)" -f $Address) }
+    return $w.ToArray()
+}
+
+function Get-DevEuiFromUid {
+    <#
+      Chip UID -> DevEUI, mirroring GetUniqueId() in common/board/src/sys_app.c.
+      Byte-for-byte copy of flash_device.ps1's inline logic (line ~284-303), kept here
+      so a DevEUI read needs no child process.
+    #>
+    param([Parameter(Mandatory = $true)][string]$SerialNumber)
+
+    $u = Read-Words -Address $UID64 -Count 2 -SerialNumber $SerialNumber
+    $udn = $u[0]
+    $id = New-Object byte[] 8
+    if ($udn -eq [uint32]::MaxValue) {
+        $u96 = Read-Words -Address 0x1FFF7590 -Count 3 -SerialNumber $SerialNumber
+        $a = [uint32](([uint64]$u96[0] + [uint64]$u96[2]) -band 0xFFFFFFFFL); $b = $u96[1]
+        $id[7]=($a -shr 24) -band 0xFF; $id[6]=($a -shr 16) -band 0xFF
+        $id[5]=($a -shr 8) -band 0xFF;  $id[4]=$a -band 0xFF
+        $id[3]=($b -shr 24) -band 0xFF; $id[2]=($b -shr 16) -band 0xFF
+        $id[1]=($b -shr 8) -band 0xFF;  $id[0]=$b -band 0xFF
+    }
+    else {
+        $cid = ($u[1] -shr 8) -band 0xFFFFFF
+        $id[0]=($cid -shr 16) -band 0xFF; $id[1]=($cid -shr 8) -band 0xFF; $id[2]=$cid -band 0xFF
+        $id[3]=$u[1] -band 0xFF
+        $id[4]=($udn -shr 24) -band 0xFF; $id[5]=($udn -shr 16) -band 0xFF
+        $id[6]=($udn -shr 8) -band 0xFF;  $id[7]=$udn -band 0xFF
+    }
+    return (($id | ForEach-Object { '{0:X2}' -f $_ }) -join '')
+}
+
 function Read-DevEui {
     <#
-      Read one device's DevEUI through flash_device.ps1 -ReadDevEuiOnly.
-
-      Runs in its own process, the way bless_rig.ps1 launches it, so the child's exit
-      calls cannot end this scan.
+      Read one device's DevEUI in-process. No child powershell.exe/flash_device.ps1
+      spawn per station - just the CLI call this scan already needs, once per probe.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$SerialNumber,
         [int]$Station = 0
     )
 
-    # -Station only selects the op-code, and the op-code is written in a step that
-    # -ReadDevEuiOnly never reaches. Station 1 is therefore a harmless filler for a
-    # probe the device list does not describe.
-    $stationArg = 1
-    if ($Station -ge 1) { $stationArg = $Station }
-
-    $out = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $deviceScript `
-                 -Station $stationArg -SerialNumber $SerialNumber -Freq $Freq -ReadDevEuiOnly)
-    $code = $LASTEXITCODE
-    $text = ($out -join "`n")
-
-    # flash_device.ps1 prints exactly one "DevEUI: <16 hex>" line on this path.
-    $eui = ''
-    if ($text -match 'DevEUI:\s*([0-9A-Fa-f]{16})') { $eui = $Matches[1].ToUpper() }
-
-    # Its failures are plain text on the success stream, so the last non-empty line is
-    # the useful one.
-    $why = "flash_device.ps1 exit $code"
-    $lines = @($out | Where-Object { $_ -and ([string]$_).Trim() })
-    if ($lines.Count -gt 0) { $why = ([string]$lines[-1]).Trim() }
-
-    return [pscustomobject]@{ DevEui = $eui; ExitCode = $code; Message = $why }
+    try {
+        $eui = Get-DevEuiFromUid -SerialNumber $SerialNumber
+        return [pscustomobject]@{ DevEui = $eui; ExitCode = 0; Message = '' }
+    }
+    catch {
+        return [pscustomobject]@{ DevEui = ''; ExitCode = 1; Message = $_.Exception.Message }
+    }
 }
 
 # --- Which stations were asked for --------------------------------------

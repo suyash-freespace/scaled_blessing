@@ -1,15 +1,15 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM Operator wrapper for scan_rig.ps1. Reports the DevEUI of every device on the
+REM Operator wrapper for scan_device.ps1. Reports the DevEUI of every device on the
 REM bench. Reads only - no device is erased or written, so this is always safe.
 REM
 REM   scan                               every station in the device list
 REM   scan 2,3                           stations 2 and 3 only
 REM   scan -Json                         JSON on stdout, for the blessing service
-REM   scan 2,3 -Freq 8000                any scan_rig.ps1 parameter works
+REM   scan 2,3 -Freq 8000                any scan_device.ps1 parameter works
 REM
 REM Exists for the same reason bless.bat does: this machine runs with the default
-REM Restricted execution policy, so ".\scan_rig.ps1" is refused with
+REM Restricted execution policy, so ".\scan_device.ps1" is refused with
 REM "running scripts is disabled on this system". The -ExecutionPolicy Bypass
 REM below applies to this one process only and changes no machine setting.
 REM
@@ -39,7 +39,7 @@ REM first character is not a dash, assume a bare station list.
 if not "%ARGS:~0,1%"=="-" set "ARGS=-Stations %ARGS%"
 
 :run
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scan_rig.ps1" ^
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scan_device.ps1" ^
   -DeviceList "%~dp0rig_devices.csv" %ARGS%
 set RC=%ERRORLEVEL%
 
@@ -55,7 +55,7 @@ if %RC% GTR 2 echo RESULT: unexpected exit code %RC%
 exit /b %RC%
 
 :usage
-echo Usage: scan [stations] [scan_rig.ps1 flags]
+echo Usage: scan [stations] [scan_device.ps1 flags]
 echo.
 echo   stations   comma-separated, e.g. 2,3    ^(NOT space-separated^)
 echo              omit to scan every station in the device list

@@ -55,9 +55,9 @@ single source of truth and both scripts derive from it.
 | `rig_layout.ps1` | Station → op-code map, validation helpers. Shared, authoritative. |
 | `flash_device.ps1` | Per-device primitive. One probe, one device, start to finish. |
 | `bless_rig.ps1` | Fan-out. Launches and monitors one process per selected station. |
-| `scan_rig.ps1` | Read-only bench scan. Reports every device's DevEUI. Erases nothing. |
+| `scan_device.ps1` | Read-only bench scan. Reports every device's DevEUI. Erases nothing. |
 | `bless.bat` | Operator wrapper for `cmd.exe`. Bench runs on the shared keys. |
-| `scan.bat` | Operator wrapper for `scan_rig.ps1`. |
+| `scan.bat` | Operator wrapper for `scan_device.ps1`. |
 | `rig_devices.csv` | This bench's `Position,SerialNumber` probe map. **Not portable.** |
 | `rig_devices.example.csv` | Template with all 6 stations. Commit this one. |
 
@@ -74,7 +74,7 @@ The firmware image defaults to `ide\Binary\BFU_FSO.bin`.
   or run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once per terminal.
 - **`rig_devices.csv` populated** with this bench's probe serials. Get them with
   `STM32_Programmer_CLI.exe -c port=SWD mode=HOTPLUG` (the `-c` output is reliable;
-  `-l st-link` has been observed to garble serials on this host). `scan_rig.ps1` also
+  `-l st-link` has been observed to garble serials on this host). `scan_device.ps1` also
   prints the serial of any attached probe the CSV does not list, as `not listed`.
 - **A reachable gateway and LNS registration.** The mass erase wipes the LoRaWAN NVM at
   `0x0803F000`, so every blessing forces a fresh OTAA join. No gateway means every device
@@ -84,7 +84,7 @@ The firmware image defaults to `ide\Binary\BFU_FSO.bin`.
 
 ## Scanning The Bench
 
-`scan_rig.ps1` answers one question: which devices are on the bench right now, and what
+`scan_device.ps1` answers one question: which devices are on the bench right now, and what
 is each one's DevEUI? **It reads only. No device is erased or written**, so it is safe to
 run at any time, including on an already blessed device.
 
@@ -92,7 +92,7 @@ Run it before a blessing to collect the DevEUIs the LNS needs, and to confirm ev
 station is populated and its probe is alive.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_rig.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_device.ps1
 ```
 
 ```
@@ -115,12 +115,13 @@ Station SerialNumber             DevEUI           State    Message
 ```
 
 Three steps: list the attached ST-LINK probes, map each serial to its station via
-`rig_devices.csv`, then read each DevEUI through `flash_device.ps1 -ReadDevEuiOnly`.
+`rig_devices.csv`, then read each device's chip UID directly and derive its DevEUI.
 
-It calls `flash_device.ps1` rather than reading the UID itself. The DevEUI comes from the
-chip UID, not the factory page, and `flash_device.ps1` already mirrors `GetUniqueId()`'s
-byte order. Reimplementing that order is exactly the kind of thing that silently
-produces a plausible-looking wrong DevEUI.
+It reads the UID in its own process. It does not call `flash_device.ps1`. This saves one
+`powershell.exe` start per station, which dominated the old scan time. The cost is a
+second copy of the byte order. `scan_device.ps1` mirrors `GetUniqueId()` the same way
+`flash_device.ps1` does. Keep the two in step. A wrong byte order produces a
+plausible-looking wrong DevEUI and no error.
 
 The `State` column names every mismatch between the bench and the device list:
 
@@ -156,7 +157,7 @@ with the LNS against the keys it is about to write.
 exit-code note below.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_rig.ps1 -Json -Stations 1,2
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_device.ps1 -Json -Stations 1,2
 ```
 
 ```json
@@ -308,14 +309,14 @@ All paths are built from `%~dp0`, so it works from any working directory.
 
 ### `scan.bat`
 
-The same wrapper treatment for `scan_rig.ps1`. It pre-fills the device list and forwards
+The same wrapper treatment for `scan_device.ps1`. It pre-fills the device list and forwards
 everything else. No arguments is the normal case — it scans the whole bench:
 
 ```bat
 scan                               REM every station in the device list
 scan 2,3                           REM stations 2 and 3 only
 scan -Json                         REM JSON on stdout, for the blessing service
-scan 2,3 -Freq 8000                REM any scan_rig.ps1 parameter works
+scan 2,3 -Freq 8000                REM any scan_device.ps1 parameter works
 scan /?                            REM usage
 ```
 
@@ -582,13 +583,12 @@ material is ever written to the status file or the logs.**
 
 The missing-image check runs **before** the erase, so a bad `-FirmwarePath` can never
 leave a wiped device. It is skipped for `-ReadDevEuiOnly`, which never flashes — that
-path must work on a machine with no current build, or `scan_rig.ps1` cannot read a
-DevEUI there.
+path must work on a machine with no current build.
 
 `bless_rig.ps1`: `0` every device passed (or, with `-NoWait`, all processes launched);
 `1` setup/validation error; `2` at least one device did not pass.
 
-`scan_rig.ps1`: `0` every listed station reported a DevEUI; `1` setup error;
+`scan_device.ps1`: `0` every listed station reported a DevEUI; `1` setup error;
 `2` a listed station is empty, or a DevEUI read failed. A `not listed` probe that reads
 successfully is a warning, not a failure — it does not change the exit code.
 

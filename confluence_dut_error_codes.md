@@ -195,7 +195,7 @@ codes. The decoded fault list belongs in the message and the status file instead
 | 1 | Setup or validation error. Nothing was flashed. |
 | 2 | At least one device did not pass. |
 
-### `scan_rig.ps1` — read DevEUIs, writes nothing
+### `scan_device.ps1` — read DevEUIs, writes nothing
 
 | Code | Meaning |
 |------|---------|
@@ -210,7 +210,7 @@ code.
 
 ## Per-station scan states
 
-`scan_rig.ps1` reports one of four states per station.
+`scan_device.ps1` reports one of four states per station.
 
 | State | Meaning |
 |-------|---------|
