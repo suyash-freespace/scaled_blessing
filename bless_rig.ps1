@@ -47,6 +47,22 @@
     Validate the list and print exactly what would be launched, touching no hardware.
     Worth doing before a 6-device run - every launch mass-erases a device.
 
+.PARAMETER Secure
+    Production only. After the verdicts are in, clear the key/region page at 0x0803F800
+    and set RDP=0xBB on every station that cleanly PASSed. Stations that did not pass are
+    never touched.
+
+    The pass test is strict: exit code 0 AND a verdict word of exactly 0xD5000000, the
+    signature with every fault bit clear. A device that was merely flashed cannot qualify.
+
+    OFF BY DEFAULT AND IT MUST STAY THAT WAY. A bring-up or debug blessing must never lock
+    its board. RDP1 is undoable - "-ob RDP=0xAA" in STM32CubeProgrammer - but only by a
+    mass erase that hands the device back blank, so an engineer re-flashing the same unit
+    all morning would lose their work on the first run.
+
+    Requires -ReadVerdict, since the pass test IS the verdict word. Refuses -NoWait, which
+    returns before any verdict exists.
+
 .EXAMPLE
     # Dry run, then bless every station in the list from the command line
     .\bless_rig.ps1 -DeviceList .\rig_devices.csv -DryRun
@@ -61,10 +77,19 @@
                     -Keys "1=$key1:$eui1,3=$key3:$eui3" `
                     -ReadVerdict -NoWait -StatusDir C:\blessing\status
 
+    # Production: bless, then clear keys and lock every device that cleanly PASSed.
+    # One JSON document carries the verdicts AND the securing result.
+    .\bless_rig.ps1 -DeviceList .\rig_devices.csv -ReadVerdict -Secure -Json
+
 .NOTES
     Exit codes: 0 = every device PASSed (or, with -NoWait, all processes launched)
                 1 = setup/validation error - reason on stderr, stdout empty under -Json
                 2 = at least one device did not PASS
+                3 = every device PASSed but securing failed on at least one (-Secure only)
+
+    Under -Secure, exit 2 still means a blessing failure and takes precedence: a device
+    that did not pass was never a candidate for securing. Exit 3 is specifically "the
+    blessing was clean, the lock was not". Read each station's rdp1 field either way.
 #>
 [CmdletBinding()]
 param(
@@ -110,6 +135,11 @@ param(
     # Off by default: the blessing service polls 0x20003400 itself. Turn this on for a
     # command-line run where you want pass/fail in the summary table.
     [switch]$ReadVerdict,
+
+    # Production only: clear the key page and set RDP=0xBB on every cleanly PASSed
+    # station, once the verdicts are in. See the .PARAMETER block above - this is off by
+    # default and must stay that way.
+    [switch]$Secure,
 
     [string]$FirmwarePath,
 
@@ -218,6 +248,111 @@ $OPCODE_BY_POSITION = $OPCODE_BY_STATION
 $deviceScript = Join-Path $PSScriptRoot 'flash_device.ps1'
 if (-not (Test-Path $deviceScript)) { throw "flash_device.ps1 not found next to this script: $deviceScript" }
 if (-not (Test-Path $DeviceList)) { throw "Device list not found: $DeviceList" }
+
+# --- -Secure constants and preconditions ---------------------------------
+# The page holding the factory data. device_dut.h calls the address
+# FACTORY_PROD_ADDRESS; flash_device.ps1 writes the 56-byte page there. STM32WL55 pages
+# are 2 KB, so 0x0803F800 is page 127, the last page of the 256 KB flash.
+# enable_security.bat erased the same page number.
+$FACTORY_PAGE_NUM = 127
+
+# RDP level 1. NOT a parameter, because 0xCC is RDP level 2 and that one is final: it
+# erases nothing but permanently disables debug access with no regression path at all.
+# 0xBB by contrast is undoable with "-ob RDP=0xAA", which mass erases the device and
+# hands it back blank - a locked board is a reflash, not a write-off. One mistyped
+# character is the difference, so the value cannot be passed in.
+$RDP_LEVEL_1 = '0xBB'
+
+# Fourth copy of this path: flash_device.ps1, scan_device.ps1 and enable_security.bat's
+# setenv.bat hold the others. Only used under -Secure. If a fifth ever appears, move it
+# into rig_layout.ps1 instead.
+$CUBE_CLI = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe"
+
+# Refuse, rather than silently do nothing. Both of the first two would otherwise make
+# -Secure an expensive no-op that looks like it worked: without -ReadVerdict there is no
+# verdict word for any station to match, and under -NoWait this script returns before a
+# single verdict exists.
+if ($Secure) {
+    $secureProblems = @()
+    if ($NoWait) {
+        $secureProblems += "-Secure cannot be combined with -NoWait: this script returns before any verdict exists. Bless with -NoWait, then secure in a separate blocking call."
+    }
+    if (-not $ReadVerdict) {
+        $secureProblems += "-Secure requires -ReadVerdict: the pass test is the DUT verdict word, so without it no station could ever qualify."
+    }
+    if (-not (Test-Path $CUBE_CLI)) {
+        $secureProblems += "STM32_Programmer_CLI not found, and -Secure needs it: $CUBE_CLI"
+    }
+    if ($secureProblems.Count -gt 0) {
+        Write-Diag "Cannot run with -Secure:"
+        Write-Diag @($secureProblems | ForEach-Object { "  - $_" })
+        exit 1
+    }
+}
+
+function Invoke-CliParallel {
+    <#
+      Run one STM32_Programmer_CLI call per item, concurrently, and return each one's
+      exit code. Used only by -Secure.
+
+      Real CLI processes rather than child powershell.exe: scan_device.ps1 measured a
+      powershell spawn at 1120 ms per station for work that was one CLI call underneath,
+      so there is no reason to pay it here either.
+
+      $Items each carry .Key (the station) and .CliArgs (string[]). Results keep .Key so
+      a caller can match a result back to its station.
+    #>
+    param([Parameter(Mandatory = $true)][object[]]$Items)
+
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($Items.Count -eq 0) { return $results.ToArray() }
+
+    $running = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $Items) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $CUBE_CLI
+        $psi.Arguments              = ($item.CliArgs -join ' ')
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+
+        $p = [System.Diagnostics.Process]::Start($psi)
+
+        # Touching .Handle NOW is what makes .ExitCode readable later - the same trap
+        # this script already documents at its Start-Process call below.
+        $null = $p.Handle
+
+        # Read both pipes asynchronously BEFORE waiting. A synchronous ReadToEnd after
+        # WaitForExit deadlocks once the CLI writes more than the pipe buffer holds.
+        $running.Add([pscustomobject]@{
+            Key = $item.Key; Proc = $p
+            OutTsk = $p.StandardOutput.ReadToEndAsync()
+            ErrTsk = $p.StandardError.ReadToEndAsync()
+        })
+    }
+
+    foreach ($r in $running) {
+        $r.Proc.WaitForExit()
+        $results.Add([pscustomobject]@{
+            Key = $r.Key; ExitCode = $r.Proc.ExitCode
+            StdOut = $r.OutTsk.Result; StdErr = $r.ErrTsk.Result
+        })
+        $r.Proc.Dispose()
+    }
+    return $results.ToArray()
+}
+
+function Get-CliFailureLine {
+    <# Last useful line of a failed CLI call, for the message column. #>
+    param([string]$StdOut, [string]$StdErr, [int]$ExitCode)
+    foreach ($src in @($StdErr, $StdOut)) {
+        if (-not $src) { continue }
+        $err = @($src -split "`r?`n" | Where-Object { $_ -match '(?i)error|fail|cannot|unable' })
+        if ($err.Count -gt 0) { return ([string]$err[-1]).Trim() }
+    }
+    return "CLI exit $ExitCode"
+}
 
 if (-not $LogDir) {
     $LogDir = Join-Path $env:TEMP ('fso_rig\{0:yyyyMMdd_HHmmss}' -f (Get-Date))
@@ -713,6 +848,124 @@ $summary = @(foreach ($p in $plan) {
     }
 })
 
+# --- Secure the devices that cleanly passed ------------------------------
+# Runs BEFORE any output, so the single JSON document below can carry both the verdicts
+# and the securing result. Printing the JSON first and securing afterwards would leave
+# the caller with no machine-readable record of the one step that erases and locks.
+#
+# Every station gets these three fields whether -Secure was used or not, so the consumer
+# never has to branch on a conditional schema:
+#   rdp1 = 'not requested'  -Secure was off
+#          'skipped'        -Secure was on, this station did not qualify
+#          'passed'         the RDP write returned 0
+#          'failed'         the RDP write did not
+$secureByStation = @{}
+$secureRan       = $false
+$secureFailed    = 0
+
+if ($Secure) {
+    # The pass test. Strict on purpose: exit 0 alone is not enough, because
+    # flash_device.ps1 also exits 0 for "flashed and rebooted; DUT verdict not polled".
+    # A clean pass is the 0xD5 signature with every fault bit clear, i.e. exactly
+    # 0xD5000000. Compared numerically - the verdict is scraped from a log, so its case
+    # is not guaranteed, and a string compare against "0xD5000000" would miss
+    # "0xd5000000".
+    #
+    # L suffix required: a bare 0xD5000000 is a negative Int32 in Windows PowerShell and
+    # never equals a real uint32 word. Same trap documented at $VERDICT_SIGNATURE.
+    $secureTargets = @($summary | Where-Object {
+        $clean = $false
+        if ($_.Verdict) {
+            try { $clean = ([Convert]::ToUInt32($_.Verdict, 16) -eq 0xD5000000L) } catch { $clean = $false }
+        }
+        $clean -and $null -ne $_.Exit -and [int]$_.Exit -eq 0 -and -not $_.Killed
+    } | ForEach-Object { $_.Station } | Sort-Object)
+
+    foreach ($s in $summary) { $secureByStation[$s.Station] = 'skipped' }
+
+    if ($secureTargets.Count -eq 0) {
+        Write-Host ""
+        Write-Host "-Secure: no station produced a clean PASS (0xD5000000 with exit 0). Nothing secured." -ForegroundColor Yellow
+    }
+    else {
+        $secureRan = $true
+        Write-Host ""
+        Write-Host ("-Secure: clearing page $FACTORY_PAGE_NUM and setting RDP=$RDP_LEVEL_1 on station(s) {0}" -f `
+            ($secureTargets -join ', ')) -ForegroundColor Red
+        Write-Host "  undo with STM32_Programmer_CLI -ob RDP=0xAA, which mass erases the device" -ForegroundColor DarkGray
+
+        # Connection string byte-for-byte what enable_security.bat used, which is proven
+        # on this rig: -c port=SWD sn=<SN> mode=UR. mode=UR (under reset) matters for the
+        # option-byte write - do not switch it to HOTPLUG without testing the RDP path.
+        $connOf = {
+            param($Sn)
+            @('-c', 'port=SWD', "sn=$Sn", 'mode=UR')
+        }
+        $snOf = @{}
+        foreach ($s in $summary) { $snOf[$s.Station] = $s.SerialNumber }
+
+        # Deliberately NO verification on either step. No page read-back after the erase
+        # and no option-byte read-back after the lock, so 'cleared' and 'locked' mean
+        # "the CLI returned 0" and nothing more.
+        $secureState = @{}
+        foreach ($s in $secureTargets) { $secureState[$s] = [pscustomobject]@{ Cleared = $false; Locked = $false; Msg = '' } }
+
+        # 1. Erase the key/region page. All stations at once.
+        $eraseJobs = @($secureTargets | ForEach-Object {
+            [pscustomobject]@{ Key = $_; CliArgs = (& $connOf $snOf[$_]) + @('-e', "$FACTORY_PAGE_NUM") }
+        })
+        foreach ($res in (Invoke-CliParallel -Items $eraseJobs)) {
+            $st = [int]$res.Key
+            if ($res.ExitCode -eq 0) { $secureState[$st].Cleared = $true }
+            else {
+                $secureState[$st].Msg = 'erase: ' + (Get-CliFailureLine -StdOut $res.StdOut -StdErr $res.StdErr -ExitCode $res.ExitCode)
+            }
+        }
+
+        # 2. Set RDP=0xBB. Fired for every target REGARDLESS of whether its erase
+        # succeeded, and the two results stay separate so a locked-but-not-cleared
+        # device is visible rather than hidden behind one combined flag.
+        $lockJobs = @($secureTargets | ForEach-Object {
+            [pscustomobject]@{ Key = $_; CliArgs = (& $connOf $snOf[$_]) + @('-ob', "RDP=$RDP_LEVEL_1") }
+        })
+        foreach ($res in (Invoke-CliParallel -Items $lockJobs)) {
+            $st = [int]$res.Key
+            if ($res.ExitCode -eq 0) {
+                $secureState[$st].Locked = $true
+                $secureByStation[$st] = 'passed'
+            }
+            else {
+                $secureByStation[$st] = 'failed'
+                $lockErr = 'lock: ' + (Get-CliFailureLine -StdOut $res.StdOut -StdErr $res.StdErr -ExitCode $res.ExitCode)
+                $secureState[$st].Msg = if ($secureState[$st].Msg) { "$($secureState[$st].Msg); $lockErr" } else { $lockErr }
+            }
+        }
+
+        $secureFailed = @($secureTargets | Where-Object { $secureByStation[$_] -ne 'passed' }).Count
+        $secureRows   = @($secureTargets | ForEach-Object {
+            [pscustomobject]@{
+                Station = $_
+                Cleared = $secureState[$_].Cleared
+                Locked  = $secureState[$_].Locked
+                Rdp1    = $secureByStation[$_]
+                Message = $secureState[$_].Msg
+            }
+        })
+
+        if (-not $Json) {
+            $secureRows | Sort-Object Station | Format-Table Station, Cleared, Locked, Rdp1, Message -AutoSize
+            $odd = @($secureRows | Where-Object { $_.Locked -and -not $_.Cleared })
+            if ($odd.Count -gt 0) {
+                Write-Host ("{0} station(s) LOCKED BUT NOT CLEARED: {1} - keys still in flash, protected only by RDP1" -f `
+                    $odd.Count, (($odd | ForEach-Object { $_.Station }) -join ', ')) -ForegroundColor Red
+            }
+            if (@($secureRows | Where-Object { $_.Locked }).Count -gt 0) {
+                Write-Host "POWER CYCLE THE RIG - RDP1 only takes effect on a power-on reset." -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 Write-Host ""
 Write-Host "==== Rig summary ====" -ForegroundColor White
 if ($Json) {
@@ -726,6 +979,10 @@ if ($Json) {
     # The terminal tables still show all three; this is the machine feed only.
     $doc = [pscustomobject]@{
         stations = @($summary | Sort-Object Station | ForEach-Object {
+            # Always present, so the consumer never branches on a conditional schema.
+            # 'not requested' when -Secure was off; see the securing block above.
+            $r = 'not requested'
+            if ($Secure -and $secureByStation.ContainsKey($_.Station)) { $r = $secureByStation[$_.Station] }
             [pscustomobject]@{
                 station      = $_.Station
                 serialNumber = $_.SerialNumber
@@ -734,11 +991,20 @@ if ($Json) {
                 exitCode     = $_.Exit
                 passed       = $_.Passed
                 killed       = $_.Killed
+                rdp1         = $r
             }
         })
         total  = @($summary).Count
         passed = @($summary | Where-Object { $_.Passed }).Count
         failed = @($summary | Where-Object { -not $_.Passed }).Count
+        # Securing roll-up. secureRequested lets the consumer tell "nothing qualified"
+        # apart from "securing was never asked for".
+        secureRequested = [bool]$Secure
+        secured         = @($summary | Where-Object {
+                              $Secure -and $secureByStation.ContainsKey($_.Station) -and
+                              $secureByStation[$_.Station] -eq 'passed'
+                          }).Count
+        secureFailed    = $secureFailed
     }
     # .ToArray()-equivalent: pass a real array, since Windows PowerShell 5.1
     # ConvertTo-Json throws "Argument types do not match" on a List[object].
@@ -793,6 +1059,16 @@ else {
 $failed = @($summary | Where-Object { -not $_.Passed })
 if ($failed.Count -eq 0) {
     Write-Host "ALL $($summary.Count) DEVICE(S) PASSED" -ForegroundColor Green
+    # Blessing was clean. Securing may not have been: exit 3 keeps that distinguishable
+    # from exit 0, so a caller cannot read "all passed" as "all shipped".
+    if ($Secure -and $secureFailed -gt 0) {
+        Write-Host "$secureFailed device(s) PASSED but were NOT secured - see the rdp1 column" -ForegroundColor Red
+        exit 3
+    }
+    if ($Secure -and -not $secureRan) {
+        Write-Host "nothing was secured: no station produced a clean PASS verdict" -ForegroundColor Yellow
+        exit 3
+    }
     exit 0
 }
 Write-Host "$($failed.Count) of $($summary.Count) device(s) did not pass" -ForegroundColor Red
