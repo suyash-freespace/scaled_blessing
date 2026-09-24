@@ -81,6 +81,10 @@
     # One JSON document carries the verdicts AND the securing result.
     .\bless_rig.ps1 -DeviceList .\rig_devices.csv -ReadVerdict -Secure -Json
 
+    # Station 3 passed its hardware and failed only its join. Reboot it and read the
+    # verdict again, writing NOTHING, then secure it if it passes this time.
+    .\bless_rig.ps1 -DeviceList .\rig_devices.csv -Stations 3 -RetryAsStation1 -Secure
+
 .NOTES
     Exit codes: 0 = every device PASSed (or, with -NoWait, all processes launched)
                 1 = setup/validation error - reason on stderr, stdout empty under -Json
@@ -90,6 +94,15 @@
     Under -Secure, exit 2 still means a blessing failure and takes precedence: a device
     that did not pass was never a candidate for securing. Exit 3 is specifically "the
     blessing was clean, the lock was not". Read each station's rdp1 field either way.
+
+    -RetryAsStation1 reuses all of the above unchanged. The only difference is what the
+    child does: it reads the factory page, rewrites it with op-code 0x11, hard resets,
+    and polls the verdict, instead of mass erasing and flashing. Securing, the summary
+    table, -Json and the exit codes are the same code, so a board that passes on a retry
+    is cleared and locked by exactly the same rules as one that passed first time.
+
+    A station reports exit 3 if that page rewrite fails, and its board then has NO keys
+    and needs a full blessing. That is the one failure mode a normal run does not have.
 #>
 [CmdletBinding()]
 param(
@@ -136,6 +149,39 @@ param(
     # command-line run where you want pass/fail in the summary table.
     [switch]$ReadVerdict,
 
+    # Retry the join on ONE station that is already blessed, as station 1.
+    #
+    # For the board that passed its hardware and failed only its join. It holds a correct
+    # image and correct keys, so there is no mass erase and no firmware write. The factory
+    # page is read back, rewritten with op-code 0x11, and the board is reset.
+    #
+    # 0x11 is US915 channel 0 (EU868 LC1) with a zero join stagger. The op-code's HIGH
+    # nibble picks the join CHANNEL, not just a stagger slot - see RegionUS915.c - so a
+    # board blessed as station 3 only ever joins on channel 2. This moves it to channel 0
+    # and drops the wait, the best odds the op-code map offers.
+    #
+    # The AppKey, JoinEUI and region are written back byte for byte, so the LNS still
+    # matches the device. Page 127 only, so the LoRaWAN NVM on page 126 survives and
+    # DevNonce stays monotonic - a full re-bless would reset it.
+    #
+    # The station confirms the op-code on its board before erasing anything, so a blank
+    # board, an already-secured board or the wrong board is refused rather than rewritten.
+    # A board left at 0x11 by an earlier failed retry is reset without a rewrite, so a
+    # second retry costs no flash cycle.
+    #
+    # ONE STATION PER RUN, enforced below: two boards forced to 0x11 would join on the
+    # same channel with no stagger, which is the collision the stagger exists to prevent.
+    #
+    # Implies -ReadVerdict. Refuses -Keys, -Region and -FirmwarePath: the keys already on
+    # the board are preserved, so accepting them would misrepresent what reached it.
+    #
+    # Combine with -Secure. A board that passes on a retry goes through exactly the same
+    # gate as one that passed first time: page 127 cleared, RDP1 set, in this same run.
+    #
+    # OPERATOR MUST BE AT THE BENCH. The reboot re-runs the whole DUT, and the PIR check
+    # waits up to 7.5 s for motion. An unattended retry reports a PIR fault on a good board.
+    [switch]$RetryAsStation1,
+
     # Production only: clear the key page and set RDP=0xBB on every cleanly PASSed
     # station, once the verdicts are in. See the .PARAMETER block above - this is off by
     # default and must stay that way.
@@ -175,6 +221,16 @@ param(
     # verifies start failing - it is the first thing to try when a probe is marginal.
     [int]$Freq = 24000,
     [int]$VerdictTimeoutSec = 180,
+
+    # How often the monitor re-reads the station status files and checks whether the
+    # children have exited. This loop does no SWD work at all - it reads a small JSON
+    # file per station - so the old 2000 ms only ever delayed the summary, and with it
+    # the -Json document, by up to 2 s after every device had already finished.
+    [int]$MonitorPollMs = 200,
+
+    # Passed to each child as -VerdictPollMs. See flash_device.ps1: the gap between
+    # verdict reads once the device is running its DUT.
+    [int]$VerdictPollMs = 400,
     [int]$OverallTimeoutSec = 600,
 
     # The summary table prints Station and Verdict only. Turn this on for the full
@@ -272,6 +328,31 @@ $CUBE_CLI = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\b
 # -Secure an expensive no-op that looks like it worked: without -ReadVerdict there is no
 # verdict word for any station to match, and under -NoWait this script returns before a
 # single verdict exists.
+# --- -RetryAsStation1 preconditions --------------------------------------
+# The parameters that describe what to WRITE are refused rather than ignored. A retry
+# writes nothing, so accepting -Keys would let an operator believe fresh key material
+# reached the board when it did not - and that is a device the LNS no longer matches.
+if ($RetryAsStation1) {
+    $retryProblems = @()
+    foreach ($opt in @('Keys', 'Region', 'FirmwarePath')) {
+        if ($PSBoundParameters.ContainsKey($opt)) {
+            $retryProblems += "-$opt cannot be combined with -RetryAsStation1: a retry preserves the keys already on the board. Drop it, or run a full blessing."
+        }
+    }
+    if ($retryProblems.Count -gt 0) {
+        Write-Diag "Cannot run with -RetryAsStation1:"
+        Write-Diag @($retryProblems | ForEach-Object { "  - $_" })
+        exit 1
+    }
+    # Reading the new verdict IS the retry. Turned on rather than demanded: -Secure
+    # below already requires it, and making the operator type both every time is noise
+    # rather than safety.
+    if (-not $ReadVerdict) {
+        $ReadVerdict = $true
+        Write-Host "-RetryAsStation1 implies -ReadVerdict." -ForegroundColor DarkGray
+    }
+}
+
 if ($Secure) {
     $secureProblems = @()
     if ($NoWait) {
@@ -480,6 +561,16 @@ if ($PSBoundParameters.ContainsKey('Stations') -and $Stations) {
     Write-Host ("Selected station(s): {0}" -f (($wanted | Sort-Object) -join ', ')) -ForegroundColor Cyan
 }
 
+# One board at a time under -RetryAsStation1. Every board it touches is forced to op-code
+# 0x11, so two of them would transmit their joins on the same channel at the same instant.
+# That is precisely the collision the per-station stagger exists to prevent, and it would
+# make the retry less likely to succeed than the failure it is meant to fix.
+if ($RetryAsStation1 -and @($rows).Count -gt 1) {
+    Write-Diag ("-RetryAsStation1 runs ONE station at a time, because it forces op-code 0x11 on every board it touches. Two boards would then join on the same channel with no stagger. Selected: {0}." -f `
+        ((@($rows | ForEach-Object { [Convert]::ToInt32($_.OpCode, 16) -band 0x0F }) | Sort-Object) -join ', '))
+    exit 1
+}
+
 # --- Parse -Keys --------------------------------------------------------
 # station -> @{ AppKey; JoinEui }. Validated here rather than in the child so a bad
 # allocation is refused BEFORE any device is erased - a station that fails validation
@@ -544,11 +635,13 @@ foreach ($r in $rows) {
     $statusFile = Join-Path $StatusDir ("station{0}.json" -f $station)
     $a = @('-Station', $station, '-SerialNumber', $r.SerialNumber,
            '-Freq', $Freq, '-VerdictTimeoutSec', $VerdictTimeoutSec,
+           '-VerdictPollMs', $VerdictPollMs,
            '-StatusFile', $statusFile)
 
     # Only wait for the DUT result if explicitly asked. By default the blessing service
     # polls 0x20003400 itself, so the child just flashes and exits.
     if ($ReadVerdict) { $a += '-ReadVerdict' }
+    if ($RetryAsStation1) { $a += '-RetryAsStation1' }
 
     # Resolve overrides into one value per option BEFORE emitting them. Appending as we
     # go would emit "-Region X -Region Y" when the CSV has a Region column and -Region is
@@ -560,17 +653,22 @@ foreach ($r in $rows) {
     #   device list column                        (per-station, static)
     #   -Region                                   (whole run)
     #   -Keys                                     (per-station, minted for this blessing)
-    $override = @{}
-    foreach ($opt in @('AppKey', 'JoinEui', 'Region')) {
-        if (($cols -contains $opt) -and $r.$opt) { $override[$opt] = $r.$opt }
+    # Skipped entirely under -RetryAsStation1. -Keys/-Region/-FirmwarePath are already
+    # refused above, and this also drops any AppKey/JoinEui/Region columns the device list
+    # happens to carry, so a retry can never hand the child key material it will not use.
+    if (-not $RetryAsStation1) {
+        $override = @{}
+        foreach ($opt in @('AppKey', 'JoinEui', 'Region')) {
+            if (($cols -contains $opt) -and $r.$opt) { $override[$opt] = $r.$opt }
+        }
+        if ($Region) { $override['Region'] = $Region }
+        if ($stationKeys.ContainsKey($station)) {
+            $override['AppKey']  = $stationKeys[$station].AppKey
+            $override['JoinEui'] = $stationKeys[$station].JoinEui
+        }
+        foreach ($opt in $override.Keys) { $a += @("-$opt", $override[$opt]) }
+        if ($FirmwarePath) { $a += @('-FirmwarePath', $FirmwarePath) }
     }
-    if ($Region) { $override['Region'] = $Region }
-    if ($stationKeys.ContainsKey($station)) {
-        $override['AppKey']  = $stationKeys[$station].AppKey
-        $override['JoinEui'] = $stationKeys[$station].JoinEui
-    }
-    foreach ($opt in $override.Keys) { $a += @("-$opt", $override[$opt]) }
-    if ($FirmwarePath) { $a += @('-FirmwarePath', $FirmwarePath) }
 
     $opCodeValue = [Convert]::ToInt32($r.OpCode, 16)
     $plan += [pscustomobject]@{
@@ -582,7 +680,9 @@ foreach ($r in $rows) {
         StaggerMs    = ((($opCodeValue -band 0x0F) - 1) * 2000)
         # Shown in the launch table so an operator can see at a glance that every station
         # got its own key material, rather than finding out from the LNS later.
-        Keys         = $(if ($stationKeys.ContainsKey($station)) { 'unique' } else { 'default' })
+        Keys         = $(if ($RetryAsStation1) { 'on device' }
+                         elseif ($stationKeys.ContainsKey($station)) { 'unique' }
+                         else { 'default' })
         Args         = $a
         Log          = Join-Path $LogDir ("{0}_{1}.log" -f $r.SerialNumber, $r.OpCode)
         ErrLog       = Join-Path $LogDir ("{0}_{1}.err.log" -f $r.SerialNumber, $r.OpCode)
@@ -594,7 +694,8 @@ foreach ($r in $rows) {
     }
 }
 
-Write-Host "FSO rig blessing - $($plan.Count) device(s)" -ForegroundColor White
+$runKind = $(if ($RetryAsStation1) { 'join retry (as station 1)' } else { 'blessing' })
+Write-Host "FSO rig $runKind - $($plan.Count) device(s)" -ForegroundColor White
 Write-Host "  device list : $DeviceList"
 if ($keepRunDir) {
     Write-Host "  logs        : $LogDir"
@@ -639,7 +740,16 @@ if ($DryRun) {
 }
 
 Write-Host ""
-Write-Host "Each launch MASS ERASES its device." -ForegroundColor Yellow
+if ($RetryAsStation1) {
+    Write-Host "Join retry as station 1: ERASES AND REWRITES page 127 (op-code -> 0x11)." -ForegroundColor Yellow
+    Write-Host "  No mass erase, no firmware write. AppKey, JoinEUI and region are preserved." -ForegroundColor DarkGray
+    Write-Host "  Page 126 (LoRaWAN NVM, DevNonce) is not touched." -ForegroundColor DarkGray
+    Write-Host "  If the write fails after the erase, the board has NO keys and needs a full blessing." -ForegroundColor Yellow
+    Write-Host "STAY AT THE BENCH. The reboot re-runs the whole DUT, and the PIR check waits up to 7.5s for motion." -ForegroundColor Yellow
+}
+else {
+    Write-Host "Each launch MASS ERASES its device." -ForegroundColor Yellow
+}
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 New-Item -ItemType Directory -Path $StatusDir -Force | Out-Null
@@ -728,7 +838,7 @@ while ((Get-Date) -lt $deadline) {
 
     $running = @($plan | Where-Object { -not $_.Process.HasExited })
     if ($running.Count -eq 0) { break }
-    Start-Sleep -Seconds 2
+    Start-Sleep -Milliseconds $MonitorPollMs
 }
 
 foreach ($p in $plan) {
@@ -1027,6 +1137,7 @@ else {
         [pscustomobject]@{ Station = $_.Station; Verdict = $shown }
     } | Format-Table -AutoSize
 }
+
 
 # --- Clean up -----------------------------------------------------------
 # Everything worth reporting is already in the table above and in the transitions printed

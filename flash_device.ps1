@@ -25,6 +25,15 @@
 
     RDP is left at level 0.
 
+    -RetryAsStation1 is the retry path. For a device that already passed its hardware
+    and failed only its join, it reads the factory page back, rewrites it with op-code
+    0x11, hard resets, and polls the verdict again. The AppKey, JoinEUI and region are
+    preserved byte for byte, so the LNS still matches the device.
+
+    0x11 means US915 channel 0 (EU868 LC1) and a zero join stagger - the widest and
+    fastest join configuration the op-code map offers. The firmware and the image are
+    never rewritten, because a board that failed only its join already holds both.
+
 .PARAMETER Station
     Physical rig station 1-6. Sets the op-code via rig_layout.ps1 and, if
     rig_devices.csv is present, resolves the ST-LINK serial for that slot.
@@ -37,10 +46,18 @@
     .\flash_device.ps1 -Station 1
     .\flash_device.ps1 -Station 2 -AppKey <32 hex> -JoinEui <16 hex> -Region EU868
 
+    # Retry the join on an already-blessed station. Writes nothing.
+    .\flash_device.ps1 -Station 3 -RetryAsStation1
+
 .NOTES
     Exit codes: 0 flashed OK | 1 setup error | 2 erase failed | 3 keys failed
                 4 flash failed
     With -ReadVerdict only: 5 verdict timeout | 6 DUT FAIL (0 then means PASS)
+
+    Under -RetryAsStation1 the codes mean the same thing, but 2 and 4 can never occur:
+    there is no mass erase and no firmware write. A refused op-code check and a failed
+    reset both report 1. A failed page rewrite reports 3, and that board then has NO
+    keys and needs a full blessing.
 #>
 param(
     [int]$Station = 1,
@@ -57,11 +74,58 @@ param(
     [switch]$ReadVerdict,
     [int]$VerdictTimeoutSec = 180,
 
+    # Gap between verdict reads while the DUT runs. One read costs about 138 ms measured
+    # on this rig, so 400 ms gives roughly a 540 ms cycle and a mean detection lag near
+    # 270 ms. It was 3000 ms, which added up to 3 s of dead time to every device AFTER it
+    # had already finished - pure latency, since the device was done and nobody looked.
+    #
+    # The reads are HOTPLUG and never reset the device, so polling faster cannot disturb
+    # the DUT or the join. Raise it if a marginal probe starts refusing connects.
+    [int]$VerdictPollMs = 400,
+
     # Read the DevEUI and exit WITHOUT touching the device. For the blessing service's
     # pre-flash step: it needs the DevEUI to register the device with the LNS against
     # the keys it is about to write. Reimplementing GetUniqueId()'s byte order in the
     # service is exactly the kind of thing that silently goes wrong, so borrow this.
     [switch]$ReadDevEuiOnly,
+
+    # Retry the LoRaWAN join on a device that is ALREADY blessed, as station 1.
+    #
+    # There is no mass erase and no firmware write: a board that passed its hardware and
+    # failed only its join already holds a correct image and correct keys. The factory
+    # page is read back, rewritten with op-code 0x11, and the board is reset.
+    #
+    # 0x11 means US915 channel 0 (EU868 LC1) and a zero join stagger. The op-code's HIGH
+    # nibble selects the join channel, not just a stagger slot - see RegionUS915.c - so a
+    # board blessed as station 3 only ever joins on channel 2. This moves it to channel 0
+    # and drops the wait, which is the best odds the op-code map offers.
+    #
+    # The AppKey, JoinEUI and region are written back byte for byte, so the LNS still
+    # matches the device.
+    #
+    # Page 127 only. The LoRaWAN NVM at 0x0803F000 (page 126) is untouched, so DevNonce
+    # stays monotonic - a full re-bless would reset it and the LNS could reject the join
+    # as a replay.
+    #
+    # TWO RISKS, both guarded below. A probe that drops between the erase and the write
+    # leaves a blank factory page, recoverable only by a full blessing. A corrupt
+    # read-back would write keys the LNS has never seen, which fails the join forever and
+    # looks exactly like a gateway fault. So the page is read twice, the two reads must
+    # agree, and the key and region bytes are sanity-checked before anything is erased.
+    #
+    # A board already holding 0x11 is reset without any rewrite, so a second retry costs
+    # no flash cycle.
+    #
+    # Safe against a stale verdict: main() calls DutResult_Init() at every boot, which
+    # clears 0x20003400 to 0x00000000. Test-VerdictWord rejects that, so the poll can
+    # never read the previous run's result.
+    #
+    # The reboot re-runs the WHOLE DUT, hardware included. PirPreProdDut() waits up to
+    # 7.5 s for motion, so the operator must be at the bench - an unattended retry can
+    # report a PIR fault on a good board.
+    #
+    # Implies -ReadVerdict: a retry that never reads the result observes nothing.
+    [switch]$RetryAsStation1,
 
     # Machine-readable progress for the blessing UI. This process overwrites the file
     # after every step transition, so whoever is watching it always sees the current
@@ -78,7 +142,7 @@ $ErrorActionPreference = 'Stop'
 # =============================================================================
 # Merged SBSFU + application image, flashed to 0x08000000. Used unless a caller
 # passes -FirmwarePath explicitly. This is the only place the location is defined.
-$FIRMWARE_IMAGE = "C:\Freespace_Projects\Gen4\fs-lorawan-gen4-monorepo\products\fso\ide\Binary\BFU_FSO.bin"
+$FIRMWARE_IMAGE = "C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_FSO.bin"
 
 $CLI = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe"
 # =============================================================================
@@ -87,6 +151,9 @@ $REGION_IDS = @{ 'AS923' = 0; 'AU915' = 1; 'CN470' = 2; 'CN779' = 3; 'EU433' = 4
                  'EU868' = 5; 'KR920' = 6; 'IN865' = 7; 'US915' = 8; 'RU864' = 9 }
 
 $FACTORY_PAGE = 0x0803F800   # device_dut.h FACTORY_PROD_ADDRESS
+$FACTORY_PAGE_NUM = 127      # STM32WL55 pages are 2 KB, so 0x0803F800 is page 127
+$FACTORY_PAGE_LEN = 0x38     # 56 bytes: the exact span a blessing writes
+$RETRY_OPCODE     = 0x11     # station 1: US915 ch 0 / EU868 LC1, zero join stagger
 $VERDICT_ADDR = 0x20003400   # .dut_result, STM32WL55JCIX_FLASH.ld
 $UID64        = 0x1FFF7580   # LL_FLASH_GetUDN / GetDeviceID / GetSTCompanyID
 
@@ -248,6 +315,83 @@ function Complete-Run {
     exit $Code
 }
 
+function Invoke-VerdictPoll {
+    <#
+      Poll the DUT verdict word until it is signed, or until the timeout expires, then
+      report and exit. NEVER RETURNS - every path ends in Complete-Run.
+
+      Shared by the normal flash path and by -RetryAsStation1, so a retry is judged by
+      exactly the same rules as a first blessing. One copy only: a second decode of the
+      verdict word is how a retry would quietly start passing boards the rig failed.
+
+      HOTPLUG only: any reset runs SBSFU, whose .data starts at exactly 0x20003400, so
+      a reset here would overwrite the verdict before the app ever wrote it.
+      Only a word Test-VerdictWord accepts ends the wait - a signed 0xD5?????? code.
+      0x00000000 means the DUT is still running (main() clears the word at every boot
+      via DutResult_Init), and 0x00005776 (FLOW_CTRL_INIT_VALUE) means SBSFU has not
+      handed over yet.
+    #>
+    Write-Status -Step 'WAIT_VERDICT' -Message 'device running DUT; polling verdict word'
+    $deadline = (Get-Date).AddSeconds($VerdictTimeoutSec)
+    $verdict = $null
+    $last = $null
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $v = (Read-Words -Address $VERDICT_ADDR -Count 1)[0]
+            $last = $v
+            if (Test-VerdictWord -Word $v) { $verdict = $v; break }
+        }
+        catch { }   # a refused connect right after the reset is expected
+        # Refresh on every poll so the UI can show this station is alive and how long it
+        # has been waiting, rather than a step that looks frozen for up to VerdictTimeoutSec.
+        $seenNow = 'no successful read yet'
+        if ($null -ne $last) { $seenNow = 'last read 0x{0:X8}' -f $last }
+        Write-Status -Step 'WAIT_VERDICT' -Message "DUT running; $seenNow"
+        Start-Sleep -Milliseconds $VerdictPollMs
+    }
+
+    if ($null -eq $verdict) {
+        $seen = 'no successful read'
+        if ($null -ne $last) { $seen = '0x{0:X8}' -f $last }
+        "VERDICT TIMEOUT after ${VerdictTimeoutSec}s (last read $seen)"
+        # 1 and 2 are the pre-coded pass/fail values. They are no longer accepted as a
+        # verdict, so name them here: the device booted and finished its DUT, but the
+        # image on it predates the coded scheme and has to be replaced.
+        if ($last -eq 1 -or $last -eq 2) {
+            "  that is a pre-coded verdict, which this rig no longer accepts - reflash with a"
+            "  build that writes the 0xD5 coded word, then bless again"
+        }
+        Complete-Run -Code 5 -Step 'WAIT_VERDICT' -State 'error' `
+            -Message "no verdict within ${VerdictTimeoutSec}s (last read $seen)"
+    }
+    $hex = '0x{0:X8}' -f $verdict
+    $detail = Get-VerdictDetail -Word $verdict
+    $script:Verdict = $hex
+    $script:Faults  = $detail.Faults
+
+    if ($detail.Passed) {
+        "VERDICT PASS  verdict=$hex"
+        Complete-Run -Code 0 -Step 'DONE' -State 'passed' -Message "DUT PASS ($hex)"
+    }
+
+    $what = 'no fault detail'
+    if ($detail.Faults.Count -gt 0) { $what = ($detail.Faults -join ', ') }
+    "VERDICT FAIL  verdict=$hex"
+    "  failed: $what"
+    if ($detail.Note) { "  $($detail.Note)" }
+    if ($detail.Faults -contains 'OTAA join') {
+        "  a fresh join needs a reachable gateway, and the AppKey/JoinEUI must already be"
+        "  registered against this DevEUI."
+        # Only when the join is the ONLY fault. A hardware bit means the board is bad and a
+        # reboot proves nothing, so never point the operator at a retry that cannot help.
+        if (-not $RetryAsStation1 -and $detail.Faults.Count -eq 1) {
+            "  the hardware passed, so this can be retried WITHOUT re-flashing:"
+            "    bless_rig.ps1 -DeviceList <list> -Stations $Station -RetryAsStation1 -Secure"
+        }
+    }
+    Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex): $what"
+}
+
 try {
     $opCode = Get-StationOpCode -Station $Station     # station 1 -> 0x11, 2 -> 0x22, ...
     $script:OpCode = $opCode
@@ -255,7 +399,7 @@ try {
     # Checked here, ahead of the erase, so a missing image cannot leave a wiped device.
     # Skipped for -ReadDevEuiOnly: that path never flashes, so requiring an image would
     # stop the rig reading DevEUIs on any machine without a current build.
-    if (-not $ReadDevEuiOnly) {
+    if (-not $ReadDevEuiOnly -and -not $RetryAsStation1) {
         if (-not $FirmwarePath) { $FirmwarePath = $FIRMWARE_IMAGE }
         if (-not (Test-Path $FirmwarePath)) { throw "firmware image not found: $FirmwarePath" }
     }
@@ -304,6 +448,145 @@ try {
     # Pre-flash query only: nothing has been erased yet, so this is safe to call at any
     # time, including on a device you do not intend to reflash.
     if ($ReadDevEuiOnly) { Complete-Run -Code 0 -Step 'DEVEUI' -State 'passed' -Message "DevEUI $devEui" }
+
+    # ---- 2b. retry the join as station 1 ------------------------------------
+    # For a device that already passed its hardware and failed only its join. It holds a
+    # correct image and correct keys, so only the op-code changes: 0x11 puts it on
+    # US915 channel 0 (EU868 LC1) with no join stagger.
+    #
+    # Returns through Invoke-VerdictPoll, so the MASS ERASE and the firmware write below
+    # are never reached. That is structural, not a convention: a retry cannot mass erase
+    # a board, because the code that does sits after a call that never returns.
+    if ($RetryAsStation1) {
+        # Read the WHOLE 56-byte page, and read it TWICE. These bytes go straight back
+        # onto the device, so one corrupt read would replace good keys with rubbish the
+        # LNS no longer matches - a board that then fails its join forever and looks
+        # exactly like a gateway fault. Two matching reads is the cheapest guard there is.
+        #
+        # It also confirms the board is the blessed one this station expects. An operator
+        # can point a retry at a blank board, an already-secured board, or the wrong board
+        # entirely, and all three look identical once the page has been erased.
+        Write-Status -Step 'OPCODE' -Message 'reading the factory page'
+        $wordCount = $FACTORY_PAGE_LEN / 4
+        $read1 = Read-Words -Address $FACTORY_PAGE -Count $wordCount
+        $read2 = Read-Words -Address $FACTORY_PAGE -Count $wordCount
+        for ($i = 0; $i -lt $wordCount; $i++) {
+            if ($read1[$i] -ne $read2[$i]) {
+                throw ("factory page read is not stable: word $i read 0x{0:X8}, then 0x{1:X8}. " -f $read1[$i], $read2[$i]) +
+                      "Drop -Freq to 8000 and try again. Nothing was written."
+            }
+        }
+
+        $onDevice = $read1[0]
+        $expected = [Convert]::ToUInt32($opCode, 16)
+        # A board forced to 0x11 by an EARLIER retry no longer carries its station's
+        # op-code. Accept it, or a second retry on the same board would be refused as
+        # "the wrong board in this slot".
+        $alreadyForced = ($onDevice -eq [uint32]$RETRY_OPCODE)
+
+        if ($onDevice -eq [uint32]::MaxValue) {
+            throw ("station $Station has no factory page: the op-code at 0x{0:X8} reads 0xFFFFFFFF. " -f $FACTORY_PAGE) +
+                  "The board is blank or already secured, so a join retry cannot work. Bless it fully instead."
+        }
+        if (-not $alreadyForced -and $onDevice -ne $expected) {
+            throw ("station $Station expects op-code $opCode, but the board holds 0x{0:X8}. " -f $onDevice) +
+                  "The wrong board is in this slot, or it was blessed for another station."
+        }
+
+        if ($alreadyForced) {
+            # An earlier forced retry already set 0x11. Rewriting would spend a flash
+            # erase cycle to change nothing, so skip straight to the reset.
+            "OPCODE OK  0x11 already set by an earlier retry; no rewrite needed"
+        }
+        else {
+            # Rebuild the page bytes exactly as the blessing wrote them: little-endian
+            # per word, which is the order -r32 hands them back in.
+            $pageBytes = New-Object byte[] $FACTORY_PAGE_LEN
+            for ($i = 0; $i -lt $wordCount; $i++) {
+                $w = $read1[$i]
+                $pageBytes[$i * 4]     = [byte]( $w          -band 0xFF)
+                $pageBytes[$i * 4 + 1] = [byte](($w -shr 8)  -band 0xFF)
+                $pageBytes[$i * 4 + 2] = [byte](($w -shr 16) -band 0xFF)
+                $pageBytes[$i * 4 + 3] = [byte](($w -shr 24) -band 0xFF)
+            }
+
+            # Refuse to preserve something that is not key material. Writing a junk page
+            # back would strand the device with keys the LNS has never seen, and nothing
+            # downstream would say why it stopped joining.
+            # NOT $appKey: PowerShell variable names are case-insensitive, so that would
+            # assign a byte array to this script's [ValidatePattern] $AppKey parameter and
+            # throw before the page was ever checked. Caught on hardware; keep the suffix.
+            $appKeyBytes = $pageBytes[0x10..0x1F]
+            if (-not ($appKeyBytes | Where-Object { $_ -ne 0xFF })) {
+                throw "the AppKey on this board reads all 0xFF, so the page holds no key material. Bless it fully instead."
+            }
+            if (-not ($appKeyBytes | Where-Object { $_ -ne 0x00 })) {
+                throw "the AppKey on this board reads all zero, so the page holds no key material. Bless it fully instead."
+            }
+            $regionId = $pageBytes[0x30]
+            if ($regionId -gt 9) {
+                throw ("the region byte on this board reads 0x{0:X2}, which is not a region id (0-9). " -f $regionId) +
+                      "The factory page is not intact. Bless it fully instead."
+            }
+            $regionName = @($REGION_IDS.GetEnumerator() | Where-Object { $_.Value -eq $regionId } |
+                            ForEach-Object { $_.Key })[0]
+
+            # Op-code -> 0x11, little-endian word at offset 0. Every other byte is
+            # exactly what the board already held.
+            $pageBytes[0] = [byte]$RETRY_OPCODE
+            $pageBytes[1] = 0; $pageBytes[2] = 0; $pageBytes[3] = 0
+            ("REKEY  op-code 0x{0:X2} -> 0x11, preserving AppKey, JoinEUI and region $regionName" -f $onDevice)
+
+            # THE ONLY WRITE ANY RETRY MAKES. From the erase until the write verifies,
+            # this board has no keys. The bytes are held in $pageBytes, so a failed write
+            # is retried in place; only this process dying loses them, and that costs a
+            # full re-bless. Page 127 only, so the LoRaWAN NVM on page 126 - and with it
+            # DevNonce - survives.
+            Write-Status -Step 'REKEY' -Message "erasing page $FACTORY_PAGE_NUM and rewriting with op-code 0x11"
+            & $CLI -c $connect.Split(' ') -e "$FACTORY_PAGE_NUM" *> $null
+            if ($LASTEXITCODE -ne 0) {
+                "REKEY FAILED - erase ($LASTEXITCODE)"
+                Complete-Run -Code 3 -Step 'REKEY' -State 'error' `
+                    -Message "page $FACTORY_PAGE_NUM erase failed (CLI exit $LASTEXITCODE); the page is unchanged or only partly erased"
+            }
+
+            $pageBin = Join-Path ([System.IO.Path]::GetTempPath()) "fso_retry_$([guid]::NewGuid().ToString('N')).bin"
+            $writeCode = 1
+            try {
+                [System.IO.File]::WriteAllBytes($pageBin, $pageBytes)
+                # Two attempts. The page is already erased, so a second try costs nothing
+                # and covers the likeliest failure here: a probe that glitched once.
+                foreach ($attempt in 1..2) {
+                    & $CLI -c $connect.Split(' ') -d $pageBin ('0x{0:X8}' -f $FACTORY_PAGE) -v *> $null
+                    $writeCode = $LASTEXITCODE
+                    if ($writeCode -eq 0) { break }
+                    "  write attempt $attempt failed (CLI exit $writeCode)"
+                }
+            }
+            finally {
+                Remove-Item $pageBin -Force -ErrorAction SilentlyContinue
+            }
+            if ($writeCode -ne 0) {
+                "REKEY FAILED - write ($writeCode)"
+                Complete-Run -Code 3 -Step 'REKEY' -State 'error' `
+                    -Message "factory page rewrite failed (CLI exit $writeCode). THE PAGE IS ERASED: this board has no keys and needs a full blessing."
+            }
+            "REKEY OK   op-code 0x11, keys and region preserved"
+        }
+
+        # Same connect string the flash step uses, which is proven on this rig.
+        # -hardRst drives NRST, so SBSFU runs and main() clears the verdict word before
+        # any DUT stage - the poll below can never read the previous run's result.
+        Write-Status -Step 'RESET' -Message 'hard reset; device re-runs its DUT'
+        & $CLI -c $connect.Split(' ') -hardRst *> $null
+        if ($LASTEXITCODE -ne 0) {
+            "RESET FAILED ($LASTEXITCODE)"
+            Complete-Run -Code 1 -Step 'RESET' -State 'error' -Message "hard reset failed (CLI exit $LASTEXITCODE)"
+        }
+        "RESET OK"
+
+        Invoke-VerdictPoll   # never returns
+    }
 
     # ---- 2. erase -----------------------------------------------------------
     Write-Status -Step 'ERASE' -Message 'mass erase'
@@ -368,64 +651,7 @@ try {
     }
 
     # ---- 5. verdict (opt-in) ------------------------------------------------
-    # HOTPLUG only: any reset runs SBSFU, whose .data starts at exactly 0x20003400,
-    # so it would overwrite the verdict before the app ever gets to write it.
-    # Only a word Test-VerdictWord accepts ends the wait - a signed 0xD5?????? code.
-    # 0x00000000 means the DUT is still running, and 0x00005776 (FLOW_CTRL_INIT_VALUE)
-    # means SBSFU has not handed over yet.
-    Write-Status -Step 'WAIT_VERDICT' -Message 'device running DUT; polling verdict word'
-    $deadline = (Get-Date).AddSeconds($VerdictTimeoutSec)
-    $verdict = $null
-    $last = $null
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $v = (Read-Words -Address $VERDICT_ADDR -Count 1)[0]
-            $last = $v
-            if (Test-VerdictWord -Word $v) { $verdict = $v; break }
-        }
-        catch { }   # a refused connect right after the reset is expected
-        # Refresh on every poll so the UI can show this station is alive and how long it
-        # has been waiting, rather than a step that looks frozen for up to VerdictTimeoutSec.
-        $seenNow = 'no successful read yet'
-        if ($null -ne $last) { $seenNow = 'last read 0x{0:X8}' -f $last }
-        Write-Status -Step 'WAIT_VERDICT' -Message "DUT running; $seenNow"
-        Start-Sleep -Seconds 3
-    }
-
-    if ($null -eq $verdict) {
-        $seen = 'no successful read'
-        if ($null -ne $last) { $seen = '0x{0:X8}' -f $last }
-        "VERDICT TIMEOUT after ${VerdictTimeoutSec}s (last read $seen)"
-        # 1 and 2 are the pre-coded pass/fail values. They are no longer accepted as a
-        # verdict, so name them here: the device booted and finished its DUT, but the
-        # image on it predates the coded scheme and has to be replaced.
-        if ($last -eq 1 -or $last -eq 2) {
-            "  that is a pre-coded verdict, which this rig no longer accepts - reflash with a"
-            "  build that writes the 0xD5 coded word, then bless again"
-        }
-        Complete-Run -Code 5 -Step 'WAIT_VERDICT' -State 'error' `
-            -Message "no verdict within ${VerdictTimeoutSec}s (last read $seen)"
-    }
-    $hex = '0x{0:X8}' -f $verdict
-    $detail = Get-VerdictDetail -Word $verdict
-    $script:Verdict = $hex
-    $script:Faults  = $detail.Faults
-
-    if ($detail.Passed) {
-        "VERDICT PASS  verdict=$hex"
-        Complete-Run -Code 0 -Step 'DONE' -State 'passed' -Message "DUT PASS ($hex)"
-    }
-
-    $what = 'no fault detail'
-    if ($detail.Faults.Count -gt 0) { $what = ($detail.Faults -join ', ') }
-    "VERDICT FAIL  verdict=$hex"
-    "  failed: $what"
-    if ($detail.Note) { "  $($detail.Note)" }
-    if ($detail.Faults -contains 'OTAA join') {
-        "  a mass erase forces a fresh join, so a gateway must be reachable and the"
-        "  AppKey/JoinEUI must already be registered against this DevEUI."
-    }
-    Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex): $what"
+    Invoke-VerdictPoll
 }
 catch {
     "SETUP FAILED: $($_.Exception.Message)"
