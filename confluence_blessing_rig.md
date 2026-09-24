@@ -3,10 +3,10 @@
 | Property | Value |
 |----------|-------|
 | **Product** | FSO (Field Sensing & Occupancy) |
-| **Scope** | Rig operation, script reference, DUT codes and service integration |
+| **Scope** | Rig operation, join retry, device release, script reference, DUT codes and service integration |
 | **Location** | `C:\Freespace_Projects\Gen4\ScaledBlessing` |
 | **Status** | In use |
-| **Last updated** | 2026-09-15 |
+| **Last updated** | 2026-09-24 |
 
 > This page replaces three earlier pages: *Parallel Device Provisioning*,
 > *Script Reference* and *DUT Error Codes*.
@@ -34,6 +34,14 @@ every verdict is in, and only when `-Secure` is passed:
 
 A device that failed its DUT is never touched by step 6 or step 7. It stays readable and
 re-blessable.
+
+Two more operations exist outside a normal blessing:
+
+- **Join retry**, `bless_rig.ps1 -RetryAsStation1`. For a device that passed its hardware
+  and failed only its join. It rewrites the op-code to `0x11` and reboots the device. There
+  is no mass erase and no firmware write. See section 9.
+- **Release**, `release_device.ps1`. Regresses a locked device from RDP1 to RDP0. This mass
+  erases the device. See section 10.
 
 Each station runs in its own `powershell.exe` process, bound to one ST-LINK probe by
 serial number. One station cannot stall, fail or crash another.
@@ -107,6 +115,10 @@ the overall timeout.
 The op-code written to `0x0803F800` identifies the station to the firmware. The **low
 nibble is the physical station**. The high nibble selects the frequency plan.
 
+The frequency plan is the **join channel**, not only a stagger group. `RegionUS915.c`
+uses it to pick the channel the device joins on. A board blessed as station 3 joins only
+on channel 2. On EU868, plan 1 is LC1.
+
 | Station | Op-code | Frequency plan | Join stagger |
 |---------|---------|----------------|--------------|
 | 1 | `0x11` | 1 | 0 ms |
@@ -127,6 +139,9 @@ Stations 1/4, 2/5 and 3/6 share a frequency plan on purpose. What stops them fro
 transmitting on top of each other is the join stagger. **Do not reassign op-codes.**
 `rig_layout.ps1` is the single source of truth and every script derives from it.
 
+`0x11` is the best join configuration in this map: channel 0 and no stagger. The join
+retry moves a device to `0x11` for that reason. See section 9.
+
 ---
 
 ## 4. Files
@@ -134,9 +149,11 @@ transmitting on top of each other is the join stagger. **Do not reassign op-code
 | File | Role |
 |------|------|
 | `rig_layout.ps1` | Station to op-code map plus helpers. Dot-sourced by the other scripts. |
-| `flash_device.ps1` | Per-device primitive. One probe, one device, start to finish. |
-| `bless_rig.ps1` | Fan-out and monitor. One child process per selected station. Owns `-Secure`. |
+| `flash_device.ps1` | Per-device primitive. One probe, one device, start to finish. Also runs the join retry. |
+| `bless_rig.ps1` | Fan-out and monitor. One child process per selected station. Owns `-Secure` and `-RetryAsStation1`. |
 | `scan_device.ps1` | Read-only bench scan. Reports each device's DevEUI. |
+| `release_device.ps1` | Regresses one locked device from RDP1 to RDP0. Mass erases it. |
+| `BFU_FSO.bin` | Merged SBSFU and application image. The default firmware for every blessing. |
 | `bless.bat` | Operator wrapper for `bless_rig.ps1`, for `cmd.exe`. |
 | `scan.bat` | Operator wrapper for `scan_device.ps1`, for `cmd.exe`. |
 | `rig_devices.csv` | This bench's `Position,SerialNumber` probe map. **Not portable.** |
@@ -145,14 +162,16 @@ transmitting on top of each other is the join stagger. **Do not reassign op-code
 ```
 bless.bat  --> bless_rig.ps1 --> flash_device.ps1   (one process per station)
 scan.bat   --> scan_device.ps1                      (in process, no child spawn)
+               release_device.ps1                   (in process, no child spawn, no .bat)
 
-rig_layout.ps1 is dot-sourced by all three scripts (station -> op-code, one definition)
+rig_layout.ps1 is dot-sourced by all four scripts (station -> op-code, one definition)
 ```
 
-All three scripts call `STM32_Programmer_CLI.exe`, for different jobs.
-`flash_device.ps1` does every erase, key write and firmware write. `scan_device.ps1`
-enumerates probes and reads the chip UID. `bless_rig.ps1` calls it directly for one job
-only: the page erase and the RDP write under `-Secure`.
+All four scripts call `STM32_Programmer_CLI.exe`, for different jobs.
+`flash_device.ps1` does every erase, key write and firmware write, and the join retry's
+page rewrite. `scan_device.ps1` enumerates probes and reads the chip UID. `bless_rig.ps1`
+calls it directly for one job only: the page erase and the RDP write under `-Secure`.
+`release_device.ps1` reads the option bytes, writes `RDP=0xAA` and reads the result back.
 
 ### `rig_devices.csv`
 
@@ -185,11 +204,12 @@ reliable. `-l` can garble serials on this host.
 
 - **STM32CubeProgrammer CLI** at
   `C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe`.
-  The path is set three times: `$CLI` in `flash_device.ps1`, the `-ProgrammerCli` default
-  in `scan_device.ps1`, and `$CUBE_CLI` in `bless_rig.ps1` for `-Secure`. Keep them in step.
-- **Firmware image** at
-  `C:\Freespace_Projects\Gen4\fs-lorawan-gen4-monorepo\products\fso\ide\Binary\BFU_FSO.bin`.
-  Override it per run with `-FirmwarePath`.
+  The path is set four times: `$CLI` in `flash_device.ps1`, the `-ProgrammerCli` default
+  in `scan_device.ps1` and in `release_device.ps1`, and `$CUBE_CLI` in `bless_rig.ps1` for
+  `-Secure`. Keep them in step.
+- **Firmware image** at `C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_FSO.bin`, in this
+  folder. It used to be read from the monorepo build output. Copy a new build here before
+  a blessing, or override it per run with `-FirmwarePath`.
 - **Execution policy.** The children are launched with `-ExecutionPolicy Bypass`. The
   parent needs the same. Use `powershell -NoProfile -ExecutionPolicy Bypass -File ...`,
   or run the `.bat` wrappers, which already do this.
@@ -334,8 +354,9 @@ Drop `-Json` for the operator view, which prints a securing table after the summ
   [12:12:12] station 4  DONE         passed  DUT PASS
 ```
 
-The monitor polls every status file every 2 seconds and prints a line only when a station
-changes step or state. A three-minute verdict wait therefore does not bury the other
+The monitor polls every status file every 200 ms (`-MonitorPollMs`) and prints a line only
+when a station changes step or state. It was 2 seconds. The loop reads small JSON files
+and does no SWD work, so the old value only delayed the summary and the `-Json` document. A three-minute verdict wait therefore does not bury the other
 stations' transitions. A station moving faster than the poll may skip a line. The status
 file is a current-state snapshot, not an event log.
 
@@ -508,11 +529,8 @@ suspected.
 
 ### Unlocking
 
-RDP1 is reversible. Regress it to level 0 from the STM32CubeProgrammer GUI, or with:
-
-```powershell
-STM32_Programmer_CLI.exe -c port=SWD sn=<SN> mode=UR -ob RDP=0xAA
-```
+RDP1 is reversible. Use `release_device.ps1`, described in section 10. It regresses RDP to
+level 0 and checks the result. The STM32CubeProgrammer GUI is the fallback.
 
 That **mass erases the device** and hands it back blank, which is the point. A locked board
 is a reflash, not a write-off. It then needs a full re-bless.
@@ -523,7 +541,158 @@ is a reflash, not a write-off. It then needs a full re-bless.
 
 ---
 
-## 9. Production flow, unique keys per blessing
+## 9. Retry a join failure
+
+`-RetryAsStation1` is for one case only. The device passed its hardware and failed only
+its join, verdict `0xD5000100`. That board already holds a correct image and correct keys,
+so a full re-bless is not needed.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\bless_rig.ps1 `
+  -DeviceList .\rig_devices.csv -Stations 3 -RetryAsStation1 -Secure
+```
+
+The retry changes one byte: the op-code, to `0x11`. That gives the device join channel 0
+and no join stagger, the best join chance in the op-code map. See section 3.
+
+When a DUT fails on the join alone, `flash_device.ps1` prints this command in its output.
+It does not print it when a hardware bit is also set.
+
+### What runs
+
+The child reads the DevEUI as usual, then takes a separate path. That path returns through
+the verdict poll, so the mass erase and the firmware write are never reached.
+
+| Step | Action | Failure exit code |
+|------|--------|-------------------|
+| `START` | Resolve station, op-code and probe. The firmware path is not checked. | 1 |
+| `DEVEUI` | Read the chip UID and compute the DevEUI. | 1 |
+| `OPCODE` | Read the 56-byte factory page twice. The two reads must agree. Check the op-code and the key bytes. | 1 |
+| `REKEY` | Erase page 127, then write the same page back with op-code `0x11`. The write is verified and tried twice. | 3 |
+| `RESET` | `-hardRst`. The device re-runs its whole DUT. | 1 |
+| `WAIT_VERDICT` | The same verdict poll as a blessing. | 5 |
+| `DONE` | Decode the verdict word. | 6 on a DUT fail |
+
+Exit codes 2 and 4 never occur on a retry. There is no mass erase and no firmware write.
+
+### Checks before anything is erased
+
+Each of these refuses the retry with exit 1. Nothing is written.
+
+- The two page reads disagree. Drop `-Freq` to 8000 and try again.
+- The op-code reads `0xFFFFFFFF`. The board is blank or already secured. Bless it fully.
+- The op-code is not this station's op-code and not `0x11`. The wrong board is in the slot.
+- The AppKey reads all `0xFF` or all `0x00`. The page holds no key material.
+- The region byte is above 9. The page is not intact.
+
+A board that already holds `0x11` from an earlier retry is reset without a rewrite. A
+second retry therefore costs no flash erase cycle.
+
+### What a retry preserves
+
+- **The AppKey, JoinEUI and region**, byte for byte. The LNS still matches the device.
+- **The LoRaWAN NVM on page 126**, at `0x0803F000`. Only page 127 is erased, so DevNonce
+  stays monotonic. A full re-bless resets DevNonce, and the LNS can then reject the join
+  as a replay.
+- **The firmware image.**
+
+A stale verdict cannot be read. `main()` calls `DutResult_Init()` at every boot, and that
+clears `0x20003400` to `0x00000000`.
+
+### Preconditions in `bless_rig.ps1`
+
+Each of these is checked before any device is touched, and each exits 1:
+
+- **One station only.** Every retried board uses op-code `0x11`. Two of them would join on
+  the same channel at the same instant, with no stagger.
+- **`-Keys`, `-Region` and `-FirmwarePath` are refused.** A retry keeps the keys on the
+  board. Accepting fresh keys would let an operator think they reached the device.
+
+Any `AppKey`, `JoinEui` or `Region` columns in the device list are also ignored.
+`-RetryAsStation1` turns on `-ReadVerdict` by itself. The launch table shows the keys as
+`on device`.
+
+Securing, the summary table, `-Json` and the rig exit codes are the same code as a normal
+run. A board that passes on a retry is cleared and locked by exactly the same gate.
+
+### Risks
+
+- **A failed page write leaves the board with no keys.** The station reports exit 3 at
+  step `REKEY`. The board needs a full blessing. This is the one failure mode a normal run
+  does not have.
+- **The operator must be at the bench.** `PirPreProdDut()` waits up to 7.5 s for motion.
+  An unattended retry reports a PIR fault on a good board.
+- **Do not retry a hardware fault.** A reboot proves nothing about a bad part.
+
+---
+
+## 10. Release a locked device
+
+`release_device.ps1` is the reverse of `-Secure`. It regresses one device from RDP1
+(`0xBB`) to RDP0 (`0xAA`).
+
+**This mass erases the device.** That is the mechanism, not a side effect. STM32 does not
+return debug access without destroying what the lock protected. The board comes back
+blank: no firmware, no keys, no op-code. It needs a full blessing before it is a device
+again.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\release_device.ps1 -Stations 2
+```
+
+### What runs
+
+1. Resolve the station to its ST-LINK serial through `rig_devices.csv`.
+2. Read the option bytes and note the RDP level.
+3. If the level is already `0xAA`, report `released: false` and stop. Nothing is erased.
+4. Otherwise write `RDP=0xAA`, with `mode=UR`.
+5. Read the option bytes back, and read `0x08000000` to confirm the flash is blank.
+
+The script calls the CLI in its own process. It spawns no child.
+
+**Unlike `-Secure`, the release is read back.** The whole job is one option-byte write, so
+the script checks that it landed. It reads the hardware even when the CLI returns non-zero.
+
+### Rules
+
+- **One station per run.** Each release destroys a provisioned board. The script refuses a
+  list, and refuses a station number outside 1 to 6.
+- **The RDP level is a constant.** `0xCC` is RDP2 and permanent. It is one character away.
+- **The DevEUI is not reported.** Computing it would need a third copy of the
+  `GetUniqueId()` byte order. The ST-LINK serial identifies the station instead.
+
+### Output
+
+Stdout is **always one JSON document**, on every exit path. Nothing is written to stderr.
+
+```json
+{ "station": 2, "serialNumber": "005100303233510A39363634",
+  "released": true, "exitCode": 0, "error": "" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `station` | The station released. `0` when the failure came before a station was resolved. |
+| `serialNumber` | The ST-LINK serial. |
+| `released` | `true` only when RDP read back as `0xAA` **and** `0x08000000` read back blank. |
+| `exitCode` | The process exit code, repeated in the document. |
+| `error` | `""` on success. One sentence otherwise. |
+
+A caller can parse stdout without checking the exit code first. This differs from
+`bless_rig.ps1 -Json`.
+
+The two failure shapes have separate messages, because they need different actions:
+
+| Message starts with | Meaning | Action |
+|---------------------|---------|--------|
+| `RDP did not regress` | The device may still be locked. | Try the STM32CubeProgrammer GUI. |
+| `RDP regressed to 0xAA but flash ... did not read back blank` | The lock opened but the flash may still hold its image. | Read the flash before you trust or ship the board. |
+
+Power cycle a released board, then bless it before shipping it.
+
+---
+
+## 11. Production flow, unique keys per blessing
 
 The AppKey and JoinEUI must be registered against the DevEUI **before the device boots**.
 `-hardRst` at the end of the flash step sends it straight into the DUT, and it attempts
@@ -550,7 +719,10 @@ the board in the slot has been identified. That forces two phases per station:
                    FAILED stations are not touched at all
 
 5  result          PASS -> keep the LNS device; power cycle the rig so RDP1 applies
-                   FAIL -> delete that LNS device; a re-bless mints new keys
+                   FAIL, join only (0xD5000100) -> keep the LNS device; retry:
+                        bless_rig.ps1 -Stations N -RetryAsStation1 -Secure
+                        same keys, so no new registration is needed
+                   FAIL, hardware -> delete that LNS device; a re-bless mints new keys
 ```
 
 Steps 3 and 4 are **one invocation**. Securing in a second call would leave a window in
@@ -583,7 +755,7 @@ surfaces as an insert failure rather than two devices quietly sharing a root key
 
 ---
 
-## 10. Parameters
+## 12. Parameters
 
 ### `bless_rig.ps1`
 
@@ -595,6 +767,7 @@ surfaces as an insert failure rather than two devices quietly sharing a root key
 | `-Keys` | none | Per-station key material. See section 7. |
 | `-ReadVerdict` | off | Wait for each DUT verdict and report it. |
 | `-Secure` | off | **Production.** Clear the key page and set RDP1 on the devices that passed. Requires `-ReadVerdict`, refuses `-NoWait`. |
+| `-RetryAsStation1` | off | Retry the join on one blessed station as op-code `0x11`. No mass erase, no firmware write. Implies `-ReadVerdict`. Refuses `-Keys`, `-Region` and `-FirmwarePath`. See section 9. |
 | `-FirmwarePath` | script default | Image for every station. |
 | `-LogDir` | `%TEMP%\fso_rig\<timestamp>` | Per-station stdout and stderr. |
 | `-KeepLogs` | off | Keep the run directory instead of deleting it. |
@@ -602,6 +775,8 @@ surfaces as an insert failure rather than two devices quietly sharing a root key
 | `-NoWait` | off | Launch and return immediately. Implies `-KeepLogs`. |
 | `-Freq` | `24000` | SWD clock in kHz. Drop to `8000` or `4000` if a probe is marginal. |
 | `-VerdictTimeoutSec` | `180` | Passed to each child. |
+| `-VerdictPollMs` | `400` | Passed to each child. The gap between verdict reads. |
+| `-MonitorPollMs` | `200` | How often the monitor reads the status files. It was 2000 ms. |
 | `-OverallTimeoutSec` | `600` | Cap on the whole monitored run. Stragglers are killed. |
 | `-FullSummary` | off | Print the full summary table instead of two columns. |
 | `-Json` | off | Print one JSON document and nothing else. |
@@ -624,7 +799,9 @@ parameters are parsed by hand.
 | `-Freq` | `24000` | SWD clock in kHz. |
 | `-ReadVerdict` | off | Poll the DUT verdict word and report pass or fail. |
 | `-VerdictTimeoutSec` | `180` | Verdict poll budget. |
+| `-VerdictPollMs` | `400` | Gap between verdict reads. It was 3000 ms. |
 | `-ReadDevEuiOnly` | off | Read the DevEUI and exit. Nothing is erased or written. |
+| `-RetryAsStation1` | off | Rewrite the factory page with op-code `0x11`, reset, and poll the verdict. See section 9. |
 | `-StatusFile` | none | Write machine-readable progress to this path. |
 
 The defaults for `-AppKey` and `-JoinEui` are shared bring-up values, for bench work only.
@@ -632,6 +809,15 @@ A production blessing must pass unique key material.
 
 This script never touches the option bytes, and it never erases the factory page it just
 wrote. Locking a device is `bless_rig.ps1 -Secure`, and it happens after the verdict.
+
+One verdict poll, `Invoke-VerdictPoll`, serves both the blessing and the retry. A retry is
+therefore judged by exactly the same rules as a first blessing.
+
+One read costs about 138 ms on this rig. With `-VerdictPollMs 400`, one poll cycle is about
+540 ms, and the mean detection lag is about 270 ms. The old 3000 ms added up to 3 s of dead
+time to every device after it had finished. The reads are `HOTPLUG` and never reset the
+device, so faster polling does not disturb the DUT or the join. Raise the value if a
+marginal probe starts to refuse connects.
 
 The probe is resolved in three steps. An explicit `-SerialNumber` wins. Otherwise the
 script reads this station's row from `rig_devices.csv`. Otherwise it leaves `sn=` off and
@@ -662,7 +848,7 @@ station number, which is still the DevEUI answer the caller wanted.
 | `ERASE` | `-e all`, connect mode `UR`. | 2 |
 | `KEYS` | Write the 56-byte factory page at `0x0803F800`, verified. | 3 |
 | `FLASH` | Write the image at `0x08000000`, verified, with `-hardRst`. | 4 |
-| `WAIT_VERDICT` | Poll `0x20003400` every 3 s, connect mode `HOTPLUG`. Opt-in. | 5 |
+| `WAIT_VERDICT` | Poll `0x20003400` every `-VerdictPollMs` (400 ms), connect mode `HOTPLUG`. Opt-in. | 5 |
 | `DONE` | Decode the verdict word. | 6 on a DUT fail |
 
 The firmware image is checked for existence **before** the erase, so a missing image can
@@ -672,9 +858,22 @@ flashes. That path must work on a machine with no current build.
 The DevEUI is read before the erase. This catches a dead or absent probe early, and it
 gives the service the DevEUI it needs for LNS registration.
 
+Under `-RetryAsStation1` the sequence after `DEVEUI` is different. See the step table in
+section 9.
+
+### `release_device.ps1`
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `-Stations` | *required* | The one station to release, 1 to 6. A list is refused. |
+| `-DeviceList` | `rig_devices.csv` beside the script | Probe map. |
+| `-Json` | ignored | Accepted so a caller can pass it like the other scripts. Output is always JSON. |
+| `-Freq` | `24000` | SWD clock in kHz. |
+| `-ProgrammerCli` | STM32CubeProgrammer path | Fourth copy of the CLI path. |
+
 ---
 
-## 11. What gets written
+## 13. What gets written
 
 ### DevEUI derivation
 
@@ -725,7 +924,7 @@ STM32_Programmer_CLI.exe -c port=SWD freq=24000 mode=HOTPLUG sn=<probe> -r8 0x08
 
 ---
 
-## 12. DUT verdict codes
+## 14. DUT verdict codes
 
 One 32-bit word at `0x20003400`. The rig reads it over SWD.
 
@@ -871,7 +1070,7 @@ code that depends on it.
 
 ---
 
-## 13. Exit codes
+## 15. Exit codes
 
 ### `flash_device.ps1`, one device
 
@@ -887,6 +1086,24 @@ code that depends on it.
 
 Exit code 6 covers every fault combination. Splitting it per fault would need eight codes.
 The decoded fault list belongs in the message and the status file instead.
+
+Under `-RetryAsStation1` the codes keep their meaning, with three differences:
+
+- Codes 2 and 4 never occur. There is no mass erase and no firmware write.
+- Code 1 also covers a refused page check and a failed reset.
+- Code 3 is a failed page rewrite. **If the erase succeeded, the board has no keys** and
+  needs a full blessing.
+
+### `release_device.ps1`, one device
+
+| Code | Meaning |
+|------|---------|
+| 0 | Released. Or the device was already at RDP0 and nothing was erased. |
+| 1 | Setup error. Bad station, no probe, or unreadable option bytes. |
+| 2 | The release did not fully take. Read `error`. |
+
+Exit 0 covers two outcomes. `released: true` means the board was locked and is now wiped.
+`released: false` means it was already open and nothing was done.
 
 ### `bless_rig.ps1`, the whole rig
 
@@ -921,7 +1138,7 @@ valid, and `failed` tells you how many stations did not answer.
 
 ---
 
-## 14. Machine-readable interfaces
+## 16. Machine-readable interfaces
 
 ### Live progress: status file, `<StatusDir>\station<N>.json`
 
@@ -959,7 +1176,7 @@ blessing.
 
 | Field | Notes |
 |-------|-------|
-| `step` | `LAUNCH`, `START`, `DEVEUI`, `ERASE`, `KEYS`, `FLASH`, `WAIT_VERDICT`, `DONE`. |
+| `step` | `LAUNCH`, `START`, `DEVEUI`, `ERASE`, `KEYS`, `FLASH`, `WAIT_VERDICT`, `DONE`. A retry uses `OPCODE`, `REKEY` and `RESET` in place of `ERASE`, `KEYS` and `FLASH`. |
 | `state` | `running`, `passed`, `failed`, `error`. This drives the station indicator. |
 | `devEui` | Available from the `DEVEUI` step onward, before anything is erased. |
 | `verdict` | Raw verdict word as hex, once one has been read. |
@@ -1098,7 +1315,7 @@ a hardware fault.
 
 ---
 
-## 15. Operator wrappers
+## 17. Operator wrappers
 
 Both wrappers exist for two reasons. This machine runs with the default `Restricted`
 execution policy, so `.\bless_rig.ps1` is refused with "running scripts is disabled on this
@@ -1161,7 +1378,7 @@ scan -Json                         REM JSON on stdout, for the blessing service
 
 ---
 
-## 16. Rules that must not be broken
+## 18. Rules that must not be broken
 
 These are the places where a tidy-looking change breaks the rig silently.
 
@@ -1187,10 +1404,18 @@ These are the places where a tidy-looking change breaks the rig silently.
 | Keep the RDP level a constant, not a parameter. | `0xBB` is reversible by a mass erase. `0xCC` is level 2 and has no regression path at all. They are one character apart. |
 | Fire the RDP write even when the erase failed, and report the two separately. | One combined flag would hide "locked but not cleared", which is a device shipped with live keys in flash. |
 | Secure before printing, never after. | The JSON document is the only machine-readable record of the erase and the lock. |
+| Keep `-RetryAsStation1` to one station per run. | Every retried board uses `0x11`. Two would join on the same channel with no stagger. |
+| Keep the retry refusing `-Keys`, `-Region` and `-FirmwarePath`. | A retry writes back the keys already on the board. Accepting new ones would misreport what reached the device. |
+| Keep the double read and the key checks before the retry's page erase. | A corrupt read written back gives keys the LNS never saw. The device then fails every join, and it looks like a gateway fault. |
+| Keep the retry on page 127 only. | Page 126 holds the LoRaWAN NVM. Erasing it resets DevNonce, and the LNS can reject the join as a replay. |
+| Keep one verdict poll for blessing and retry. | A second decode is how a retry would start to pass boards the rig failed. |
+| Do not name the retry's AppKey variable `$appKey`. | PowerShell names are case-insensitive. It would bind to the `[ValidatePattern]` `$AppKey` parameter and throw. This was seen on hardware. |
+| Keep `release_device.ps1` to one station per run. | Each release destroys a provisioned board. |
+| Report `released: true` only when RDP and the blank flash both read back. | An option byte that moved while the flash did not is a board that may still hold its image. |
 
 ---
 
-## 17. Troubleshooting
+## 19. Troubleshooting
 
 | Symptom | Cause and fix |
 |---------|---------------|
@@ -1209,6 +1434,17 @@ These are the places where a tidy-looking change breaks the rig silently.
 | Verdict reads `0x00005776` forever | Something reset the device. A verdict read must use `mode=HOTPLUG`. |
 | `DUT FAIL` with all hardware checks passing | The OTAA join failed. The mass erase forces a fresh join, so a gateway must be reachable **and** the keys must already be registered against that DevEUI. |
 | An `OTAA join` fault on every device | Same cause, rig-wide. Check the gateway first. |
+| An `OTAA join` fault on one device, hardware passed | Retry it: `bless_rig.ps1 -Stations N -RetryAsStation1 -Secure`. Do not reflash it. |
+| Retry refused: `-RetryAsStation1 runs ONE station at a time` | More than one station was selected. Retry them one by one. |
+| Retry refused: `-Keys cannot be combined with -RetryAsStation1` | Drop `-Keys`, `-Region` or `-FirmwarePath`. A retry keeps the keys on the board. |
+| Retry refused: `factory page read is not stable` | Two page reads disagreed. Drop `-Freq` to 8000 and retry. Nothing was written. |
+| Retry refused: `has no factory page` | The op-code reads `0xFFFFFFFF`. The board is blank or already secured. Bless it fully. |
+| Retry refused: `expects op-code ..., but the board holds ...` | The wrong board is in the slot, or it was blessed for another station. |
+| Retry exit 3 at step `REKEY` | The page rewrite failed. If the message says `THE PAGE IS ERASED`, the board has no keys. Bless it fully. |
+| A retry reports a PIR fault on a good board | Nobody triggered the PIR during the 7.5 s window. Retry again with an operator at the bench. |
+| Release: `RDP did not regress` | The device may still be locked. Try the STM32CubeProgrammer GUI. |
+| Release: `flash ... did not read back blank` | The lock opened but the image may remain. Read the flash before you trust or ship the board. |
+| Release: `Name exactly ONE station` | A list was passed. Release one station per run. |
 | Summary shows "no exit code and no verdict logged" | The child died before writing anything. Re-run with `-KeepLogs` and read the `.err.log`. |
 | No `STM32_Programmer_CLI` error text anywhere | It only survives in the child log. Re-run with `-KeepLogs`. |
 | A station stuck mid-step in the UI | The child was killed. `bless_rig.ps1` stamps state `error` on an overall timeout, but an externally killed child cannot be stamped. |
@@ -1217,12 +1453,12 @@ These are the places where a tidy-looking change breaks the rig silently.
 | Exit 3 and `rdp1` says `failed` | The RDP write failed on that station. Read the `Message` column. The device is unlocked and, if its erase succeeded, blank. |
 | `rdp1` says `skipped` on a device you expected to lock | The gate is exactly `0xD5000000` with exit 0. Any fault bit, a verdict timeout, or a run without `-ReadVerdict` means skipped. |
 | A device secured this run still answers the debugger | Expected until a power cycle. Option bytes load on reset only. |
-| Cannot connect to a device secured earlier | Expected. It is at RDP1. Regress with `-ob RDP=0xAA`, which mass erases it, or unlock from the STM32CubeProgrammer GUI. |
-| Securing table shows `Cleared False` / `Locked True` | **Do not ship it.** The keys are still in flash behind RDP1. Regress with `-ob RDP=0xAA` and re-bless. |
+| Cannot connect to a device secured earlier | Expected. It is at RDP1. Run `release_device.ps1 -Stations N`, which mass erases it, or unlock from the STM32CubeProgrammer GUI. |
+| Securing table shows `Cleared False` / `Locked True` | **Do not ship it.** The keys are still in flash behind RDP1. Run `release_device.ps1` and re-bless. |
 
 ---
 
-## 18. Known gaps and maintenance
+## 20. Known gaps and maintenance
 
 | Gap | Impact |
 |-----|--------|
@@ -1233,15 +1469,22 @@ These are the places where a tidy-looking change breaks the rig silently.
 | Individual fault bits not each provoked | The `0xD5000000` pass word and the fail path have both been seen on hardware. A first sighting of a specific fault code is still worth confirming against the board. |
 | `products/tim/app/device_dut.h` | Still carries the stale `REGION_FLASH_ADDR 0x0803F840`. TIM is otherwise unaffected. |
 | No `-ExpectDevEui` guard | Deliberate. Boards leave the rig only after PASS or FAIL, so there is no swap window between the DevEUI read and the flash. |
+| A retry can strand a board with no keys | If the probe drops or the process dies between the page erase and the write, the keys are lost. The board then needs a full blessing. |
+| A retry re-runs the PIR check | An operator must be at the bench. An unattended retry fails a good board on PIR. |
+| `release_device.ps1` has no `.bat` wrapper | Run it through `powershell -NoProfile -ExecutionPolicy Bypass -File`. |
 
 ### Maintenance points
 
-- **The CLI path exists three times.** `$CLI` in `flash_device.ps1`, the `-ProgrammerCli`
-  default in `scan_device.ps1`, and `$CUBE_CLI` in `bless_rig.ps1`. A fourth copy lives
-  outside the repo, in `enable_security.bat`'s `setenv.bat`. If a fifth appears, move the
-  path into `rig_layout.ps1`.
-- **The firmware path is hardcoded** in `flash_device.ps1` as `$FIRMWARE_IMAGE`. It is
-  overridable per run with `-FirmwarePath`.
+- **The CLI path now exists four times in the repo.** `$CLI` in `flash_device.ps1`, the
+  `-ProgrammerCli` default in `scan_device.ps1` and `release_device.ps1`, and `$CUBE_CLI`
+  in `bless_rig.ps1`. A fifth copy lives outside the repo, in `enable_security.bat`'s
+  `setenv.bat`. **That reaches the limit the repo rule set.** Move the path into
+  `rig_layout.ps1`.
+- **The firmware path is hardcoded** in `flash_device.ps1` as `$FIRMWARE_IMAGE`. It now
+  points at `BFU_FSO.bin` in this folder, not at the monorepo build output. Copy each new
+  build here. The path is overridable per run with `-FirmwarePath`.
+- **The DevEUI byte order exists twice**, in `flash_device.ps1` and `scan_device.ps1`.
+  `release_device.ps1` does not report a DevEUI, so that a third copy is not needed.
 - **`rig_devices.csv` is bench-specific** and holds real probe serials. Only
   `rig_devices.example.csv` is portable.
 - **The `-DeviceList` help text in `bless_rig.ps1` is out of date.** It says the required
