@@ -322,7 +322,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\bless_rig.ps1 `
   -DeviceList .\rig_devices.csv -Stations 2,3,4 -Region US915 -ReadVerdict -KeepLogs
 ```
 
-### Production run, unique keys and securing
+### Production run, per-station keys and securing
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\bless_rig.ps1 `
@@ -418,9 +418,13 @@ already have lost its keys and NVM:
 | Condition | Behaviour |
 |-----------|-----------|
 | Malformed entry | Refuse the run |
-| Same AppKey or JoinEUI on two stations | Refuse the run |
+| Same station given keys twice | Refuse the run. The script cannot tell which pair is registered with the LNS. |
 | Keys given for a station not in this run | Refuse the run. The allocation and the station list disagree. |
 | Selected station with no keys | Warn, mark `default` in the launch table, proceed |
+
+The script does not check whether keys differ between stations. Two stations can share an
+AppKey or a JoinEUI. Each station gets the keys you give it, and the launch table marks it
+`given`.
 
 ---
 
@@ -692,7 +696,7 @@ Power cycle a released board, then bless it before shipping it.
 
 ---
 
-## 11. Production flow, unique keys per blessing
+## 11. Production flow, keys per blessing
 
 The AppKey and JoinEUI must be registered against the DevEUI **before the device boots**.
 `-hardRst` at the end of the flash step sends it straight into the DUT, and it attempts
@@ -805,7 +809,7 @@ parameters are parsed by hand.
 | `-StatusFile` | none | Write machine-readable progress to this path. |
 
 The defaults for `-AppKey` and `-JoinEui` are shared bring-up values, for bench work only.
-A production blessing must pass unique key material.
+A production blessing must pass the keys registered with the LNS, through `-Keys`.
 
 This script never touches the option bytes, and it never erases the factory page it just
 wrote. Locking a device is `bless_rig.ps1 -Secure`, and it happens after the verdict.

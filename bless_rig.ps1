@@ -137,6 +137,8 @@ param(
     # EUI-64). Both are written byte-REVERSED by flash_device.ps1 - pass them in the
     # natural order the LNS shows, exactly as you registered them.
     #
+    # Stations may share an AppKey or a JoinEUI: nothing checks that the keys differ.
+    #
     # Wins over any AppKey/JoinEui column in the device list. Anything omitted falls back
     # to flash_device.ps1's shared bring-up defaults, which this script warns about,
     # because shipping production devices on a shared root key is a silent defect.
@@ -251,7 +253,7 @@ param(
     # Exit 0 and exit 2 both emit the document.
     #
     # On exit 1, read STDERR for the reason: the refusal is written there as plain
-    # lines, one per problem, e.g. "AppKey is identical on stations 2, 4". Capture it -
+    # lines, one per problem, e.g. "station 2 has keys given more than once". Capture it -
     # discarding stderr turns every validation failure into a bare exit 1.
     [switch]$Json,
 
@@ -278,7 +280,7 @@ if ($Json) {
 #
 # These must survive -Json. Write-Host is a no-op there, so routing a refusal through
 # it left the caller with exit 1, an empty stdout and no idea what was wrong - a
-# duplicate AppKey and an unreadable device list looked identical. stderr is the right
+# malformed -Keys entry and an unreadable device list looked identical. stderr is the right
 # channel: stdout stays a single parse-able document, and the reason travels with it.
 #
 # [Console]::Error rather than Write-Error on purpose - Write-Error decorates the text
@@ -604,14 +606,8 @@ if ($Keys) {
         }
     }
 
-    # Two devices sharing a root key, or a JoinEUI already spoken for, is a provisioning
-    # bug that is invisible on the rig and painful to unpick at the LNS.
-    foreach ($f in @('AppKey', 'JoinEui')) {
-        $dups = $stationKeys.Keys | Group-Object { $stationKeys[$_].$f } | Where-Object { $_.Count -gt 1 }
-        foreach ($d in $dups) {
-            $problems += "$f is identical on stations $(($d.Group | Sort-Object) -join ', ')"
-        }
-    }
+    # No check that keys differ between stations. The caller owns key allocation, so two
+    # stations may share an AppKey or a JoinEUI; each is written exactly as given.
 
     if ($problems.Count -gt 0) {
         Write-Diag "Key allocation is not usable:"
@@ -678,10 +674,10 @@ foreach ($r in $rows) {
         FreqPlan     = ($opCodeValue -shr 4) -band 0x0F
         Slot         = $opCodeValue -band 0x0F
         StaggerMs    = ((($opCodeValue -band 0x0F) - 1) * 2000)
-        # Shown in the launch table so an operator can see at a glance that every station
-        # got its own key material, rather than finding out from the LNS later.
+        # Shown in the launch table so an operator can see at a glance which stations got
+        # keys from -Keys, rather than finding out from the LNS later.
         Keys         = $(if ($RetryAsStation1) { 'on device' }
-                         elseif ($stationKeys.ContainsKey($station)) { 'unique' }
+                         elseif ($stationKeys.ContainsKey($station)) { 'given' }
                          else { 'default' })
         Args         = $a
         Log          = Join-Path $LogDir ("{0}_{1}.log" -f $r.SerialNumber, $r.OpCode)
