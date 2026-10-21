@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Bless several FSO devices concurrently, one process per ST-LINK probe.
+    Bless several FSO or TIM devices concurrently, one process per ST-LINK probe.
 
 .DESCRIPTION
     Thin fan-out wrapper around flash_device.ps1. Each selected station gets its own
@@ -52,8 +52,10 @@
     and set RDP=0xBB on every station that cleanly PASSed. Stations that did not pass are
     never touched.
 
-    The pass test is strict: exit code 0 AND a verdict word of exactly 0xD5000000, the
-    signature with every fault bit clear. A device that was merely flashed cannot qualify.
+    The pass test is strict: exit code 0 AND a PASS verdict word for this run's -Product:
+    the 0xD5 signature, the right product in byte 2, and every fault bit clear. On FSO
+    that is exactly 0xD5000000; a TIM pass is 0xD5400000 or 0xD5420000. A device that
+    was merely flashed cannot qualify.
 
     OFF BY DEFAULT AND IT MUST STAY THAT WAY. A bring-up or debug blessing must never lock
     its board. RDP1 is undoable - "-ob RDP=0xAA" in STM32CubeProgrammer - but only by a
@@ -127,6 +129,13 @@ param(
     # The blessing UI carries one region per run, so this is its injection point.
     [ValidateSet('AS923','AU915','CN470','CN779','EU433','EU868','KR920','IN865','US915','RU864')]
     [string]$Region,
+
+    # FSO or TIM, for the whole run. Passed to every station, retries included: it picks
+    # flash_device.ps1's default image and the verdict rules, because a TIM board writes
+    # its MLX status in byte 2 of the verdict. ONE is the blessing server's name for the
+    # FSO family, so it is accepted and treated as FSO.
+    [ValidateSet('FSO','ONE','TIM')]
+    [string]$Product = 'FSO',
 
     # Per-station key material, freshly minted for this blessing. One entry per selected
     # station, as station=<appKey>:<joinEui>, comma-separated:
@@ -262,6 +271,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# One spelling from here on. ValidateSet is case-insensitive, so 'tim' arrives as typed.
+$Product = $Product.ToUpper()
+if ($Product -eq 'ONE') { $Product = 'FSO' }
 
 if ($Json) {
     # Silence every human-facing line from one place. A script-scope function shadows
@@ -629,7 +642,7 @@ foreach ($r in $rows) {
     # serial is passed explicitly so the child never has to re-read the device list.
     $station = ($r.OpCode | ForEach-Object { [Convert]::ToInt32($_, 16) -band 0x0F })
     $statusFile = Join-Path $StatusDir ("station{0}.json" -f $station)
-    $a = @('-Station', $station, '-SerialNumber', $r.SerialNumber,
+    $a = @('-Station', $station, '-SerialNumber', $r.SerialNumber, '-Product', $Product,
            '-Freq', $Freq, '-VerdictTimeoutSec', $VerdictTimeoutSec,
            '-VerdictPollMs', $VerdictPollMs,
            '-StatusFile', $statusFile)
@@ -691,7 +704,7 @@ foreach ($r in $rows) {
 }
 
 $runKind = $(if ($RetryAsStation1) { 'join retry (as station 1)' } else { 'blessing' })
-Write-Host "FSO rig $runKind - $($plan.Count) device(s)" -ForegroundColor White
+Write-Host "$Product rig $runKind - $($plan.Count) device(s)" -ForegroundColor White
 Write-Host "  device list : $DeviceList"
 if ($keepRunDir) {
     Write-Host "  logs        : $LogDir"
@@ -809,6 +822,36 @@ function Read-StationStatus {
     catch { return $null }   # caught mid-rename; next poll gets it
 }
 
+function Get-VerdictClass {
+    <#
+      'pass', 'fail' or '' for a logged verdict string, by the same rules as
+      flash_device.ps1. Used by the no-exit-code fallback and by -Secure, so the two can
+      never disagree about what a pass is.
+
+        - The 0xD5 signature.
+        - Byte 2 names the product: 0x00 = FSO. On TIM it is 0x01 (no MLX, with bit 3
+          set), 0x40 or 0x42 (with bit 3 clear).
+        - A verdict from the other product's firmware is a fail, whatever its bits say.
+        - Otherwise zero fault bits is a pass.
+
+      '' means the string is not a verdict for any product.
+      L suffixes required: a bare 0xD5000000 is a negative Int32 in Windows PowerShell.
+    #>
+    param([string]$Verdict)
+    try { $v = [Convert]::ToUInt32($Verdict, 16) } catch { return '' }
+    if (($v -band 0xFF000000L) -ne 0xD5000000L) { return '' }
+    $mlx   = ($v -band 0x00FF0000L) -shr 16
+    $noMlx = (($v -band 0x0008L) -ne 0)
+    $wordProduct = ''
+    if ($mlx -eq 0x00) { $wordProduct = 'FSO' }
+    elseif ($mlx -eq 0x01 -and $noMlx) { $wordProduct = 'TIM' }
+    elseif (($mlx -eq 0x40 -or $mlx -eq 0x42) -and -not $noMlx) { $wordProduct = 'TIM' }
+    if (-not $wordProduct) { return '' }
+    if ($wordProduct -ne $Product) { return 'fail' }
+    if (($v -band 0x0000FFFFL) -eq 0) { return 'pass' }
+    return 'fail'
+}
+
 Write-Host ""
 Write-Host "Monitoring $($plan.Count) station(s) in parallel (verdict timeout ${VerdictTimeoutSec}s, overall cap ${OverallTimeoutSec}s)..."
 $deadline = (Get-Date).AddSeconds($OverallTimeoutSec)
@@ -891,17 +934,20 @@ $summary = @(foreach ($p in $plan) {
     $devEui = ''
     $verdict = ''
     $faults = ''
+    $mlx = ''
     # The status file is the structured source; fall back to scraping the log so a run
     # made without status files (or one whose child died before writing) still reports.
     $s = Read-StationStatus -Path $p.StatusFile
     if ($null -ne $s -and $s.devEui) { $devEui = $s.devEui }
     if ($null -ne $s -and $s.PSObject.Properties['verdict'] -and $s.verdict) { $verdict = $s.verdict }
     if ($null -ne $s -and $s.PSObject.Properties['faults'] -and $s.faults) { $faults = (@($s.faults) -join ', ') }
+    if ($null -ne $s -and $s.PSObject.Properties['mlx'] -and $s.mlx) { $mlx = $s.mlx }
     if (Test-Path $p.Log) {
         $text = Get-Content $p.Log -Raw
         if (-not $devEui -and $text -match 'DevEUI:\s*([0-9A-Fa-f]{16})') { $devEui = $Matches[1] }
         if (-not $verdict -and $text -match 'verdict=(0x[0-9A-Fa-f]{8})') { $verdict = $Matches[1] }
         if (-not $faults -and $text -match '(?m)^\s*failed:\s*(.+)$') { $faults = $Matches[1].Trim() }
+        if (-not $mlx -and $text -match 'verdict=0x[0-9A-Fa-f]{8}\s+mlx=(\S+)') { $mlx = $Matches[1] }
     }
     # Prefer the exit code; fall back to the verdict the child logged, so a process
     # bookkeeping problem here can never misreport a device that actually passed.
@@ -918,18 +964,15 @@ $summary = @(foreach ($p in $plan) {
     }
     elseif ($verdict) {
         # No exit code, but a verdict was logged. Decode it the same way
-        # flash_device.ps1 does: the signature plus zero fault bits is a pass. The
-        # pre-coded 1 and 2 are not verdicts any more, so they fall through to
-        # "unrecognised" instead of being reported as a pass or a fail.
-        # L suffixes required: a bare 0xD5000000 is a negative Int32 in Windows
-        # PowerShell and never matches a real uint32 word. See flash_device.ps1.
-        $v = [Convert]::ToUInt32($verdict, 16)
-        $signed = ((($v -band 0xFF000000L) -eq 0xD5000000L) -and (($v -band 0x00FF0000L) -eq 0))
-        if ($signed -and ($v -band 0x0000FFFFL) -eq 0) {
+        # flash_device.ps1 does - see Get-VerdictClass. The pre-coded 1 and 2 are not
+        # verdicts any more, so they fall through to "unrecognised" instead of being
+        # reported as a pass or a fail.
+        $class = Get-VerdictClass -Verdict $verdict
+        if ($class -eq 'pass') {
             $meaning = 'PASS (from log; no exit code)'
             $passed = $true
         }
-        elseif ($signed) {
+        elseif ($class -eq 'fail') {
             $meaning = 'DUT FAIL (from log; no exit code)'
         }
         else {
@@ -946,6 +989,7 @@ $summary = @(foreach ($p in $plan) {
         OpCode       = $p.OpCode
         DevEUI       = $devEui
         Verdict      = $verdict
+        Mlx          = $mlx
         Faults       = $faults
         Exit         = $p.ExitCode
         Result       = $meaning
@@ -972,18 +1016,12 @@ $secureFailed    = 0
 if ($Secure) {
     # The pass test. Strict on purpose: exit 0 alone is not enough, because
     # flash_device.ps1 also exits 0 for "flashed and rebooted; DUT verdict not polled".
-    # A clean pass is the 0xD5 signature with every fault bit clear, i.e. exactly
-    # 0xD5000000. Compared numerically - the verdict is scraped from a log, so its case
-    # is not guaranteed, and a string compare against "0xD5000000" would miss
-    # "0xd5000000".
-    #
-    # L suffix required: a bare 0xD5000000 is a negative Int32 in Windows PowerShell and
-    # never equals a real uint32 word. Same trap documented at $VERDICT_SIGNATURE.
+    # A clean pass is a PASS verdict for this run's product - see Get-VerdictClass. On
+    # FSO that is exactly 0xD5000000; a TIM pass is 0xD5400000 or 0xD5420000. Decoded
+    # numerically - the verdict is scraped from a log, so its case is not guaranteed.
     $secureTargets = @($summary | Where-Object {
         $clean = $false
-        if ($_.Verdict) {
-            try { $clean = ([Convert]::ToUInt32($_.Verdict, 16) -eq 0xD5000000L) } catch { $clean = $false }
-        }
+        if ($_.Verdict) { $clean = ((Get-VerdictClass -Verdict $_.Verdict) -eq 'pass') }
         $clean -and $null -ne $_.Exit -and [int]$_.Exit -eq 0 -and -not $_.Killed
     } | ForEach-Object { $_.Station } | Sort-Object)
 
@@ -991,7 +1029,7 @@ if ($Secure) {
 
     if ($secureTargets.Count -eq 0) {
         Write-Host ""
-        Write-Host "-Secure: no station produced a clean PASS (0xD5000000 with exit 0). Nothing secured." -ForegroundColor Yellow
+        Write-Host "-Secure: no station produced a clean $Product PASS verdict with exit 0. Nothing secured." -ForegroundColor Yellow
     }
     else {
         $secureRan = $true
@@ -1118,7 +1156,7 @@ if ($Json) {
 }
 elseif ($FullSummary) {
     $summary | Sort-Object Station |
-        Format-Table Station, SerialNumber, OpCode, DevEUI, Verdict, Faults, Exit, Result -AutoSize
+        Format-Table Station, SerialNumber, OpCode, DevEUI, Verdict, Mlx, Faults, Exit, Result -AutoSize
 }
 else {
     # Two columns by default: station and verdict, which is what a bench run is read
@@ -1127,10 +1165,14 @@ else {
     # A station that never produced a verdict word - setup error, erase failure,
     # timeout, killed - would leave Verdict blank and the whole row uninformative. So
     # fall back to the result text for those, and the column always says something.
+    #
+    # TIM adds a third column, the MLX variant that answered, because that is the one
+    # thing an operator cannot read off the verdict hex at a glance.
     $summary | Sort-Object Station | ForEach-Object {
         $shown = $_.Verdict
         if (-not $shown) { $shown = $_.Result }
-        [pscustomobject]@{ Station = $_.Station; Verdict = $shown }
+        if ($Product -eq 'TIM') { [pscustomobject]@{ Station = $_.Station; Verdict = $shown; Mlx = $_.Mlx } }
+        else { [pscustomobject]@{ Station = $_.Station; Verdict = $shown } }
     } | Format-Table -AutoSize
 }
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Flash one FSO device: erase -> op-code/keys/region -> firmware -> reboot.
+    Flash one FSO or TIM device: erase -> op-code/keys/region -> firmware -> reboot.
 
 .DESCRIPTION
     The per-device primitive for the 6-station rig. bless_rig.ps1 fans this out, one
@@ -42,6 +42,12 @@
     32 hex chars MSB-first, as the LNS shows it. Stored byte-reversed (see below).
     Defaults to the bring-up value; a front-end supplying generated keys passes this.
 
+.PARAMETER Product
+    FSO (the default) or TIM. ONE is accepted as another name for FSO, because the
+    blessing server calls that product family ONE. It picks the default firmware image
+    and the verdict rules: a TIM board writes its MLX status in byte 2 of the verdict,
+    and a verdict from the other product's firmware fails as "wrong firmware".
+
 .EXAMPLE
     .\flash_device.ps1 -Station 1
     .\flash_device.ps1 -Station 2 -AppKey <32 hex> -JoinEui <16 hex> -Region EU868
@@ -65,6 +71,10 @@ param(
     [ValidatePattern('^[0-9A-Fa-f]{16}$')][string]$JoinEui = '0E0D0D010E01020E',
     [ValidateSet('AS923','AU915','CN470','CN779','EU433','EU868','KR920','IN865','US915','RU864')]
     [string]$Region = 'US915',
+
+    # FSO or TIM. Picks the default image and the verdict decode rules. ONE is the
+    # blessing server's name for the FSO family, so it is accepted and treated as FSO.
+    [ValidateSet('FSO','ONE','TIM')][string]$Product = 'FSO',
     [string]$SerialNumber,
     [string]$FirmwarePath,
     [int]$Freq = 24000,
@@ -137,12 +147,19 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'rig_layout.ps1')   # station -> op-code, one source of truth
 
+# One spelling from here on. ValidateSet is case-insensitive, so 'tim' arrives as typed.
+$Product = $Product.ToUpper()
+if ($Product -eq 'ONE') { $Product = 'FSO' }
+
 # =============================================================================
-# EDIT THESE TWO PATHS IF THEY MOVE
+# EDIT THESE PATHS IF THEY MOVE
 # =============================================================================
-# Merged SBSFU + application image, flashed to 0x08000000. Used unless a caller
-# passes -FirmwarePath explicitly. This is the only place the location is defined.
-$FIRMWARE_IMAGE = "C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_FSO.bin"
+# Merged SBSFU + application image per product, flashed to 0x08000000. Used unless a
+# caller passes -FirmwarePath explicitly. This is the only place the locations are defined.
+$FIRMWARE_IMAGES = @{
+    FSO = "C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_FSO.bin"
+    TIM = "C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_TIM.bin"
+}
 
 $CLI = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe"
 # =============================================================================
@@ -158,11 +175,15 @@ $VERDICT_ADDR = 0x20003400   # .dut_result, STM32WL55JCIX_FLASH.ld
 $UID64        = 0x1FFF7580   # LL_FLASH_GetUDN / GetDeviceID / GetSTCompanyID
 
 # ---- DUT verdict word ------------------------------------------------------
-# Layout, mirroring products/fso/app/device_dut.h:
+# Layout, mirroring products/fso/app/device_dut.h and products/tim/app/device_dut.h:
 #
 #     31    24 | 23    16 | 15     8 | 7      0
-#       0xD5   |   0x00   |  stage 2 |  stage 1
-#     signature   reserved   faults     faults
+#       0xD5   | product  |  stage 2 |  stage 1
+#     signature  / MLX       faults     faults
+#
+# Byte 2 names the product. FSO always writes 0x00, because it has no MLX check. TIM
+# writes its MLX status there and never 0x00: 0x40 = MLX90640 answered, 0x42 = MLX90642
+# answered, 0x01 = no MLX answered (and then fault bit 3 is set as well).
 #
 # The signature is what makes a read trustworthy. .dut_result is NOLOAD and is
 # cleared only when the op-code matches, so the word can hold stale bytes; the one
@@ -175,8 +196,9 @@ $UID64        = 0x1FFF7580   # LL_FLASH_GetUDN / GetDeviceID / GetSTCompanyID
 # Verified: (3573547015 -band 0xFF000000) -eq 0xD5000000 is False, with L it is True.
 $VERDICT_SIGNATURE      = 0xD5000000L
 $VERDICT_SIGNATURE_MASK = 0xFF000000L
-$VERDICT_RESERVED_MASK  = 0x00FF0000L
+$VERDICT_MLX_MASK       = 0x00FF0000L   # byte 2: 0x00 on FSO, the MLX status on TIM
 $VERDICT_FAULT_MASK     = 0x0000FFFFL
+$VERDICT_FAULT_MLX      = 0x0008L       # TIM bit 3: no MLX sensor answered
 
 # Bit -> operator-facing name, in the order faults are reported. "KTD I2C" and not
 # "LED" on purpose: a clear bit only proves the KTD2026 answered on I2C, and says
@@ -186,12 +208,33 @@ $VERDICT_FAULT_MASK     = 0x0000FFFFL
 # the element at that POSITION, not the value for that key - so [4] threw and [1]
 # silently returned the wrong fault name. A plain @{} would fix the lookup but leaves
 # the report order undefined.
+#
+# An entry with a Product names its bit only on that product's verdicts. Bit 3 means
+# "no MLX answered" on TIM and is unassigned on FSO, so an FSO word with bit 3 set still
+# reports it as unknown. "MLX I2C" for the same reason as "KTD I2C": the check is an I2C
+# ACK only.
 $VERDICT_FAULT_NAMES = @(
     @{ Bit = 0x0001L; Name = 'PIR' }
     @{ Bit = 0x0002L; Name = 'SPI flash' }
     @{ Bit = 0x0004L; Name = 'KTD I2C' }
+    @{ Bit = 0x0008L; Name = 'MLX I2C'; Product = 'TIM' }
     @{ Bit = 0x0100L; Name = 'OTAA join' }
 )
+
+function Get-VerdictProduct {
+    <# 'FSO' or 'TIM' for a signed verdict word, $null for anything else. #>
+    param([uint32]$Word)
+    if (($Word -band $VERDICT_SIGNATURE_MASK) -ne $VERDICT_SIGNATURE) { return $null }
+    # Byte 2 alone names the product. On TIM it must also agree with bit 3: 0x01 (no MLX)
+    # always comes with bit 3 set, and 0x40/0x42 never do. TIM firmware writes nothing
+    # else, so any other pairing is stale RAM rather than a verdict.
+    $mlx   = ($Word -band $VERDICT_MLX_MASK) -shr 16
+    $noMlx = (($Word -band $VERDICT_FAULT_MLX) -ne 0)
+    if ($mlx -eq 0x00) { return 'FSO' }
+    if ($mlx -eq 0x01 -and $noMlx) { return 'TIM' }
+    if (($mlx -eq 0x40 -or $mlx -eq 0x42) -and -not $noMlx) { return 'TIM' }
+    return $null
+}
 
 function Test-VerdictWord {
     <# True when the word is a verdict rather than stale RAM or a mid-run read. #>
@@ -200,20 +243,33 @@ function Test-VerdictWord {
     # are NOT accepted: that firmware is not going to production, so a board still
     # holding it must report a verdict timeout rather than a pass or a fault name. The
     # timeout path names 1 and 2 explicitly, so the operator is told to reflash.
-    return ((($Word -band $VERDICT_SIGNATURE_MASK) -eq $VERDICT_SIGNATURE) -and
-            (($Word -band $VERDICT_RESERVED_MASK) -eq 0))
+    #
+    # A verdict for the OTHER product counts too. It ends the wait, and Get-VerdictDetail
+    # then fails it as wrong firmware: waiting it out would only turn a clear "wrong
+    # image" into a VERDICT TIMEOUT.
+    return ($null -ne (Get-VerdictProduct -Word $Word))
 }
 
 function Get-VerdictDetail {
-    <# Decode a verdict word into pass/fail plus the named faults. #>
+    <# Decode a verdict word into pass/fail, the named faults and, on TIM, the MLX variant. #>
     param([uint32]$Word)
 
     # Only ever called with a word Test-VerdictWord accepted, so the signature is
-    # present and pass/fail is the fault bits alone.
+    # present and pass/fail is the fault bits alone - unless the word comes from the
+    # other product's firmware.
+    $wordProduct = Get-VerdictProduct -Word $Word
     $bits = $Word -band $VERDICT_FAULT_MASK
     $faults = New-Object System.Collections.Generic.List[string]
+
+    # Checked first: a verdict from the other product's firmware is a fail, whatever its
+    # bits say. FSO firmware on a TIM board writes 0xD5000000 - a clean FSO pass that
+    # never looked for the MLX sensor.
+    $wrongImage = ($wordProduct -ne $Product)
+    if ($wrongImage) { $faults.Add("wrong firmware ($wordProduct verdict on a $Product run)") }
+
     $named = 0L
     foreach ($f in $VERDICT_FAULT_NAMES) {
+        if ($f.Product -and $f.Product -ne $wordProduct) { continue }
         $named = $named -bor $f.Bit
         if (($bits -band $f.Bit) -ne 0) { $faults.Add($f.Name) }
     }
@@ -228,10 +284,21 @@ function Get-VerdictDetail {
     $note = ''
     if (($bits -band 0x00FF) -ne 0) { $note = 'join not attempted (hardware failed first)' }
 
+    # The MLX variant that answered, from byte 2. TIM only: FSO has no MLX.
+    $mlx = ''
+    if ($wordProduct -eq 'TIM') {
+        $id = ($Word -band $VERDICT_MLX_MASK) -shr 16
+        if ($id -eq 0x40) { $mlx = 'MLX90640' }
+        elseif ($id -eq 0x42) { $mlx = 'MLX90642' }
+        else { $mlx = 'none' }
+    }
+
     return [pscustomobject]@{
-        Passed = ($bits -eq 0)
-        Faults = $faults.ToArray()
-        Note   = $note
+        Passed  = (($bits -eq 0) -and -not $wrongImage)
+        Faults  = $faults.ToArray()
+        Note    = $note
+        Product = $wordProduct
+        Mlx     = $mlx
     }
 }
 
@@ -262,6 +329,7 @@ $script:OpCode      = ''
 $script:CurrentStep = 'START'
 $script:Verdict     = ''    # raw verdict word as hex, once one has been read
 $script:Faults      = @()   # decoded fault names for that word
+$script:Mlx         = ''    # TIM only: MLX variant that answered, or 'none'
 
 function Write-Status {
     param(
@@ -281,12 +349,14 @@ function Write-Status {
         serialNumber = $SerialNumber
         devEui       = $script:DevEui
         region       = $Region
+        product      = $Product
         step         = $Step
         state        = $State
         message      = $Message
         exitCode     = $ExitCode
         verdict      = $script:Verdict
         faults       = @($script:Faults)
+        mlx          = $script:Mlx
         pid          = $PID
         startedUtc   = $script:StartedUtc.ToString('o')
         updatedUtc   = $now.ToString('o')
@@ -368,17 +438,26 @@ function Invoke-VerdictPoll {
     $detail = Get-VerdictDetail -Word $verdict
     $script:Verdict = $hex
     $script:Faults  = $detail.Faults
+    $script:Mlx     = $detail.Mlx
+
+    # TIM only: name the MLX variant on the verdict line and in the status message.
+    $mlxLine = ''; $mlxMsg = ''
+    if ($detail.Mlx) { $mlxLine = "  mlx=$($detail.Mlx)"; $mlxMsg = ", MLX $($detail.Mlx)" }
 
     if ($detail.Passed) {
-        "VERDICT PASS  verdict=$hex"
-        Complete-Run -Code 0 -Step 'DONE' -State 'passed' -Message "DUT PASS ($hex)"
+        "VERDICT PASS  verdict=$hex$mlxLine"
+        Complete-Run -Code 0 -Step 'DONE' -State 'passed' -Message "DUT PASS ($hex$mlxMsg)"
     }
 
     $what = 'no fault detail'
     if ($detail.Faults.Count -gt 0) { $what = ($detail.Faults -join ', ') }
-    "VERDICT FAIL  verdict=$hex"
+    "VERDICT FAIL  verdict=$hex$mlxLine"
     "  failed: $what"
     if ($detail.Note) { "  $($detail.Note)" }
+    if ($detail.Product -ne $Product) {
+        "  the board runs $($detail.Product) firmware, but this run is for $Product."
+        "  reflash it with the $Product image, or pass the right -Product."
+    }
     if ($detail.Faults -contains 'OTAA join') {
         "  a fresh join needs a reachable gateway, and the AppKey/JoinEUI must already be"
         "  registered against this DevEUI."
@@ -389,7 +468,7 @@ function Invoke-VerdictPoll {
             "    bless_rig.ps1 -DeviceList <list> -Stations $Station -RetryAsStation1 -Secure"
         }
     }
-    Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex): $what"
+    Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex$mlxMsg): $what"
 }
 
 try {
@@ -400,7 +479,7 @@ try {
     # Skipped for -ReadDevEuiOnly: that path never flashes, so requiring an image would
     # stop the rig reading DevEUIs on any machine without a current build.
     if (-not $ReadDevEuiOnly -and -not $RetryAsStation1) {
-        if (-not $FirmwarePath) { $FirmwarePath = $FIRMWARE_IMAGE }
+        if (-not $FirmwarePath) { $FirmwarePath = $FIRMWARE_IMAGES[$Product] }
         if (-not (Test-Path $FirmwarePath)) { throw "firmware image not found: $FirmwarePath" }
     }
 
@@ -416,7 +495,7 @@ try {
     $connect = "port=SWD freq=$Freq mode=UR"
     if ($SerialNumber) { $connect += " sn=$SerialNumber" }
 
-    "Station $Station  opcode $opCode  region $Region  freq $Freq"
+    "Station $Station  product $Product  opcode $opCode  region $Region  freq $Freq"
     if ($SerialNumber) { "ST-LINK $SerialNumber" }
 
     # ---- 1. DevEUI, before anything is erased --------------------------------
@@ -634,7 +713,8 @@ try {
 
     # ---- 4. firmware --------------------------------------------------------
     # Last, with -hardRst, so the device boots into the DUT with keys already in place.
-    # BFU_FSO.bin ends well below 0x0803F800 and cannot disturb what we just wrote.
+    # BFU_FSO.bin and BFU_TIM.bin share the SBSFU slot map, so both end well below
+    # 0x0803F800 and cannot disturb what we just wrote.
     Write-Status -Step 'FLASH' -Message 'writing firmware image'
     & $CLI -c $connect.Split(' ') -d $FirmwarePath 0x08000000 -v -hardRst *> $null
     if ($LASTEXITCODE -ne 0) {
