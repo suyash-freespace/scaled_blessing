@@ -84,8 +84,10 @@
     .\bless_rig.ps1 -DeviceList .\rig_devices.csv -ReadVerdict -Secure -Json
 
     # Station 3 passed its hardware and failed only its join. Reboot it and read the
-    # verdict again, writing NOTHING, then secure it if it passes this time.
-    .\bless_rig.ps1 -DeviceList .\rig_devices.csv -Stations 3 -RetryAsStation1 -Secure
+    # verdict again, writing NOTHING, then secure it if it passes this time. Pass the
+    # same -Product as the first run: a retry does not reflash, so a TIM board retried
+    # without -Product TIM fails as wrong firmware.
+    .\bless_rig.ps1 -DeviceList .\rig_devices.csv -Stations 3 -Product TIM -RetryAsStation1 -Secure
 
 .NOTES
     Exit codes: 0 = every device PASSed (or, with -NoWait, all processes launched)
@@ -824,31 +826,23 @@ function Read-StationStatus {
 
 function Get-VerdictClass {
     <#
-      'pass', 'fail' or '' for a logged verdict string, by the same rules as
-      flash_device.ps1. Used by the no-exit-code fallback and by -Secure, so the two can
-      never disagree about what a pass is.
+      'pass', 'fail' or '' for a logged verdict string. Used by the no-exit-code fallback
+      and by -Secure, so the two can never disagree about what a pass is.
 
-        - The 0xD5 signature.
-        - Byte 2 names the product: 0x00 = FSO. On TIM it is 0x01 (no MLX, with bit 3
-          set), 0x40 or 0x42 (with bit 3 clear).
+        - Get-VerdictProduct names the product that wrote the word, or $null if it is
+          not a verdict. It lives in rig_layout.ps1 and flash_device.ps1 uses the same
+          function, so this script cannot accept a word that one rejects.
         - A verdict from the other product's firmware is a fail, whatever its bits say.
         - Otherwise zero fault bits is a pass.
 
       '' means the string is not a verdict for any product.
-      L suffixes required: a bare 0xD5000000 is a negative Int32 in Windows PowerShell.
     #>
     param([string]$Verdict)
     try { $v = [Convert]::ToUInt32($Verdict, 16) } catch { return '' }
-    if (($v -band 0xFF000000L) -ne 0xD5000000L) { return '' }
-    $mlx   = ($v -band 0x00FF0000L) -shr 16
-    $noMlx = (($v -band 0x0008L) -ne 0)
-    $wordProduct = ''
-    if ($mlx -eq 0x00) { $wordProduct = 'FSO' }
-    elseif ($mlx -eq 0x01 -and $noMlx) { $wordProduct = 'TIM' }
-    elseif (($mlx -eq 0x40 -or $mlx -eq 0x42) -and -not $noMlx) { $wordProduct = 'TIM' }
+    $wordProduct = Get-VerdictProduct -Word $v
     if (-not $wordProduct) { return '' }
     if ($wordProduct -ne $Product) { return 'fail' }
-    if (($v -band 0x0000FFFFL) -eq 0) { return 'pass' }
+    if (($v -band $VERDICT_FAULT_MASK) -eq 0) { return 'pass' }
     return 'fail'
 }
 

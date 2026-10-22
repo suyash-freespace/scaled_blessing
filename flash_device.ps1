@@ -175,30 +175,9 @@ $VERDICT_ADDR = 0x20003400   # .dut_result, STM32WL55JCIX_FLASH.ld
 $UID64        = 0x1FFF7580   # LL_FLASH_GetUDN / GetDeviceID / GetSTCompanyID
 
 # ---- DUT verdict word ------------------------------------------------------
-# Layout, mirroring products/fso/app/device_dut.h and products/tim/app/device_dut.h:
-#
-#     31    24 | 23    16 | 15     8 | 7      0
-#       0xD5   | product  |  stage 2 |  stage 1
-#     signature  / MLX       faults     faults
-#
-# Byte 2 names the product. FSO always writes 0x00, because it has no MLX check. TIM
-# writes its MLX status there and never 0x00: 0x40 = MLX90640 answered, 0x42 = MLX90642
-# answered, 0x01 = no MLX answered (and then fault bit 3 is set as well).
-#
-# The signature is what makes a read trustworthy. .dut_result is NOLOAD and is
-# cleared only when the op-code matches, so the word can hold stale bytes; the one
-# seen in practice is 0x00005776, SBSFU's uFlowCryptoValue, read before SBSFU hands
-# over. Pass/fail is the fault bits alone - zero faults means pass.
-# The L suffixes are REQUIRED, not decoration. Windows PowerShell types a bare
-# 0xD5000000 as Int32, which overflows to -721420288; comparing that against a real
-# uint32 read from the device is always false, so the poll loop would never accept a
-# verdict and every device would report VERDICT TIMEOUT. The suffix forces Int64.
-# Verified: (3573547015 -band 0xFF000000) -eq 0xD5000000 is False, with L it is True.
-$VERDICT_SIGNATURE      = 0xD5000000L
-$VERDICT_SIGNATURE_MASK = 0xFF000000L
-$VERDICT_MLX_MASK       = 0x00FF0000L   # byte 2: 0x00 on FSO, the MLX status on TIM
-$VERDICT_FAULT_MASK     = 0x0000FFFFL
-$VERDICT_FAULT_MLX      = 0x0008L       # TIM bit 3: no MLX sensor answered
+# The layout, the $VERDICT_* masks and the product rule (Get-VerdictProduct,
+# Get-VerdictMlx) live in rig_layout.ps1, shared with bless_rig.ps1 so the two scripts
+# can never disagree about which word is a verdict.
 
 # Bit -> operator-facing name, in the order faults are reported. "KTD I2C" and not
 # "LED" on purpose: a clear bit only proves the KTD2026 answered on I2C, and says
@@ -220,21 +199,6 @@ $VERDICT_FAULT_NAMES = @(
     @{ Bit = 0x0008L; Name = 'MLX I2C'; Product = 'TIM' }
     @{ Bit = 0x0100L; Name = 'OTAA join' }
 )
-
-function Get-VerdictProduct {
-    <# 'FSO' or 'TIM' for a signed verdict word, $null for anything else. #>
-    param([uint32]$Word)
-    if (($Word -band $VERDICT_SIGNATURE_MASK) -ne $VERDICT_SIGNATURE) { return $null }
-    # Byte 2 alone names the product. On TIM it must also agree with bit 3: 0x01 (no MLX)
-    # always comes with bit 3 set, and 0x40/0x42 never do. TIM firmware writes nothing
-    # else, so any other pairing is stale RAM rather than a verdict.
-    $mlx   = ($Word -band $VERDICT_MLX_MASK) -shr 16
-    $noMlx = (($Word -band $VERDICT_FAULT_MLX) -ne 0)
-    if ($mlx -eq 0x00) { return 'FSO' }
-    if ($mlx -eq 0x01 -and $noMlx) { return 'TIM' }
-    if (($mlx -eq 0x40 -or $mlx -eq 0x42) -and -not $noMlx) { return 'TIM' }
-    return $null
-}
 
 function Test-VerdictWord {
     <# True when the word is a verdict rather than stale RAM or a mid-run read. #>
@@ -284,21 +248,12 @@ function Get-VerdictDetail {
     $note = ''
     if (($bits -band 0x00FF) -ne 0) { $note = 'join not attempted (hardware failed first)' }
 
-    # The MLX variant that answered, from byte 2. TIM only: FSO has no MLX.
-    $mlx = ''
-    if ($wordProduct -eq 'TIM') {
-        $id = ($Word -band $VERDICT_MLX_MASK) -shr 16
-        if ($id -eq 0x40) { $mlx = 'MLX90640' }
-        elseif ($id -eq 0x42) { $mlx = 'MLX90642' }
-        else { $mlx = 'none' }
-    }
-
     return [pscustomobject]@{
         Passed  = (($bits -eq 0) -and -not $wrongImage)
         Faults  = $faults.ToArray()
         Note    = $note
         Product = $wordProduct
-        Mlx     = $mlx
+        Mlx     = (Get-VerdictMlx -Word $Word)   # TIM only: the MLX variant that answered
     }
 }
 
@@ -463,9 +418,11 @@ function Invoke-VerdictPoll {
         "  registered against this DevEUI."
         # Only when the join is the ONLY fault. A hardware bit means the board is bad and a
         # reboot proves nothing, so never point the operator at a retry that cannot help.
+        # -Product goes in the command too. A retry does not reflash, so without it a TIM
+        # board is retried as FSO, and its pass then fails as wrong firmware.
         if (-not $RetryAsStation1 -and $detail.Faults.Count -eq 1) {
             "  the hardware passed, so this can be retried WITHOUT re-flashing:"
-            "    bless_rig.ps1 -DeviceList <list> -Stations $Station -RetryAsStation1 -Secure"
+            "    bless_rig.ps1 -DeviceList <list> -Stations $Station -Product $Product -RetryAsStation1 -Secure"
         }
     }
     Complete-Run -Code 6 -Step 'DONE' -State 'failed' -Message "DUT FAIL ($hex$mlxMsg): $what"

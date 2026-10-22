@@ -1,6 +1,7 @@
 <#
-    Canonical FSO rig layout - dot-sourced by flash_device.ps1 and bless_rig.ps1 so
-    there is exactly ONE definition of station -> op-code.
+    Canonical rig layout - dot-sourced by every rig script so there is exactly ONE
+    definition of station -> op-code, and ONE of which DUT verdict word each product
+    writes (see the end of this file).
 
     The op-code's LOW nibble IS the physical rig station, and the frequency plan in
     the high nibble deliberately cycles 1,2,3,1,2,3 across the six stations.
@@ -92,4 +93,74 @@ function Resolve-StationProbe {
     }
 
     return $match[0].SerialNumber
+}
+
+# ---- DUT verdict word ------------------------------------------------------
+# Shared by flash_device.ps1, which polls and decodes the word, and bless_rig.ps1, which
+# decides from the logged word whether a station may be secured. Kept here so the two can
+# never disagree about which word is a verdict, or which product wrote it.
+#
+# Layout, mirroring products/fso/app/device_dut.h and products/tim/app/device_dut.h:
+#
+#     31    24 | 23    16 | 15     8 | 7      0
+#       0xD5   | product  |  stage 2 |  stage 1
+#     signature  / MLX       faults     faults
+#
+# Byte 2 names the product. FSO always writes 0x00, because it has no MLX check. TIM
+# writes its MLX status there and never 0x00: an ID from $VERDICT_MLX_IDS when a sensor
+# answered, or 0x01 when none did (and then fault bit 3 is set as well).
+#
+# The signature is what makes a read trustworthy. .dut_result is NOLOAD and is
+# cleared only when the op-code matches, so the word can hold stale bytes; the one
+# seen in practice is 0x00005776, SBSFU's uFlowCryptoValue, read before SBSFU hands
+# over. Pass/fail is the fault bits alone - zero faults means pass.
+# The L suffixes are REQUIRED, not decoration. Windows PowerShell types a bare
+# 0xD5000000 as Int32, which overflows to -721420288; comparing that against a real
+# uint32 read from the device is always false, so the poll loop would never accept a
+# verdict and every device would report VERDICT TIMEOUT. The suffix forces Int64.
+# Verified: (3573547015 -band 0xFF000000) -eq 0xD5000000 is False, with L it is True.
+$VERDICT_SIGNATURE      = 0xD5000000L
+$VERDICT_SIGNATURE_MASK = 0xFF000000L
+$VERDICT_MLX_MASK       = 0x00FF0000L   # byte 2: 0x00 on FSO, the MLX status on TIM
+$VERDICT_FAULT_MASK     = 0x0000FFFFL
+$VERDICT_FAULT_MLX      = 0x0008L       # TIM bit 3: no MLX sensor answered
+$VERDICT_MLX_NONE       = 0x01          # TIM byte 2: no MLX sensor answered
+
+# TIM byte 2 -> the MLX variant that answered (DUT_MLX_ID_* in products/tim/app/device_dut.h).
+# A new sensor is one line here, and both scripts then accept it.
+$VERDICT_MLX_IDS = @{
+    0x40 = 'MLX90640'
+    0x42 = 'MLX90642'
+}
+
+function Get-VerdictMlxId {
+    <# Byte 2 of a verdict word. #>
+    param([uint32]$Word)
+    # [int] on purpose: the shift yields an Int64, and a hashtable does not match an
+    # Int64 64 against the Int32 64 that keys $VERDICT_MLX_IDS.
+    return [int](($Word -band $VERDICT_MLX_MASK) -shr 16)
+}
+
+function Get-VerdictProduct {
+    <# 'FSO' or 'TIM' for a signed verdict word, $null for anything else. #>
+    param([uint32]$Word)
+    if (($Word -band $VERDICT_SIGNATURE_MASK) -ne $VERDICT_SIGNATURE) { return $null }
+    # Byte 2 alone names the product. On TIM it must also agree with bit 3: NONE always
+    # comes with bit 3 set, and a sensor ID never does. TIM firmware writes nothing else,
+    # so any other pairing is stale RAM rather than a verdict.
+    $id    = Get-VerdictMlxId -Word $Word
+    $noMlx = (($Word -band $VERDICT_FAULT_MLX) -ne 0)
+    if ($id -eq 0x00) { return 'FSO' }
+    if ($id -eq $VERDICT_MLX_NONE -and $noMlx) { return 'TIM' }
+    if ($VERDICT_MLX_IDS.ContainsKey($id) -and -not $noMlx) { return 'TIM' }
+    return $null
+}
+
+function Get-VerdictMlx {
+    <# TIM only: the MLX variant named in byte 2, or 'none'. '' for any other word. #>
+    param([uint32]$Word)
+    if ((Get-VerdictProduct -Word $Word) -ne 'TIM') { return '' }
+    $id = Get-VerdictMlxId -Word $Word
+    if ($VERDICT_MLX_IDS.ContainsKey($id)) { return $VERDICT_MLX_IDS[$id] }
+    return 'none'
 }
