@@ -42,9 +42,9 @@
     Emit the rows as JSON instead of a table, for the blessing service to consume.
 
 .EXAMPLE
-    .\scan_device.ps1
-    .\scan_device.ps1 -Stations 1,3
-    .\scan_device.ps1 -Json | ConvertFrom-Json
+    .\scan_rig.ps1
+    .\scan_rig.ps1 -Stations 1,3
+    .\scan_rig.ps1 -Json | ConvertFrom-Json
 
 .NOTES
     Exit codes: 0 = every listed station answered | 1 = setup error

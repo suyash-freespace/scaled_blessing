@@ -151,17 +151,17 @@ retry moves a device to `0x11` for that reason. See section 9.
 | `rig_layout.ps1` | Station to op-code map plus helpers. Dot-sourced by the other scripts. |
 | `flash_device.ps1` | Per-device primitive. One probe, one device, start to finish. Also runs the join retry. |
 | `bless_rig.ps1` | Fan-out and monitor. One child process per selected station. Owns `-Secure` and `-RetryAsStation1`. |
-| `scan_device.ps1` | Read-only bench scan. Reports each device's DevEUI. |
+| `scan_rig.ps1` | Read-only bench scan. Reports each device's DevEUI. |
 | `release_device.ps1` | Regresses one locked device from RDP1 to RDP0. Mass erases it. |
 | `BFU_FSO.bin` | Merged SBSFU and application image. The default firmware for every blessing. |
 | `bless.bat` | Operator wrapper for `bless_rig.ps1`, for `cmd.exe`. |
-| `scan.bat` | Operator wrapper for `scan_device.ps1`, for `cmd.exe`. |
+| `scan.bat` | Operator wrapper for `scan_rig.ps1`, for `cmd.exe`. |
 | `rig_devices.csv` | This bench's `Position,SerialNumber` probe map. **Not portable.** |
 | `rig_devices.example.csv` | Template for all six stations. Commit this one. |
 
 ```
 bless.bat  --> bless_rig.ps1 --> flash_device.ps1   (one process per station)
-scan.bat   --> scan_device.ps1                      (in process, no child spawn)
+scan.bat   --> scan_rig.ps1                      (in process, no child spawn)
                release_device.ps1                   (in process, no child spawn, no .bat)
 
 rig_layout.ps1 is dot-sourced by all four scripts (station -> op-code, one definition)
@@ -169,7 +169,7 @@ rig_layout.ps1 is dot-sourced by all four scripts (station -> op-code, one defin
 
 All four scripts call `STM32_Programmer_CLI.exe`, for different jobs.
 `flash_device.ps1` does every erase, key write and firmware write, and the join retry's
-page rewrite. `scan_device.ps1` enumerates probes and reads the chip UID. `bless_rig.ps1`
+page rewrite. `scan_rig.ps1` enumerates probes and reads the chip UID. `bless_rig.ps1`
 calls it directly for one job only: the page erase and the RDP write under `-Secure`.
 `release_device.ps1` reads the option bytes, writes `RDP=0xAA` and reads the result back.
 
@@ -205,7 +205,7 @@ reliable. `-l` can garble serials on this host.
 - **STM32CubeProgrammer CLI** at
   `C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe`.
   The path is set four times: `$CLI` in `flash_device.ps1`, the `-ProgrammerCli` default
-  in `scan_device.ps1` and in `release_device.ps1`, and `$CUBE_CLI` in `bless_rig.ps1` for
+  in `scan_rig.ps1` and in `release_device.ps1`, and `$CUBE_CLI` in `bless_rig.ps1` for
   `-Secure`. Keep them in step.
 - **Firmware image** at `C:\Freespace_Projects\Gen4\ScaledBlessing\BFU_FSO.bin`, in this
   folder. It used to be read from the monorepo build output. Copy a new build here before
@@ -222,7 +222,7 @@ reliable. `-l` can garble serials on this host.
 
 ## 6. Scan the bench
 
-`scan_device.ps1` answers one question. Which devices are on the bench, and what is each
+`scan_rig.ps1` answers one question. Which devices are on the bench, and what is each
 one's DevEUI? **It reads only. No device is erased or written.** A scan is safe at any
 time, including on an already blessed device.
 
@@ -230,7 +230,7 @@ Run it before a blessing. It collects the DevEUIs the LNS needs, and it confirms
 station is populated and its probe is alive.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_device.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scan_rig.ps1
 ```
 
 ```
@@ -267,7 +267,7 @@ scan should surface. `bless_rig.ps1` will never select a probe the list does not
 
 ### Why the scan is in process
 
-Step 3 runs in `scan_device.ps1` itself. No child is spawned. Measured on the rig, this
+Step 3 runs in `scan_rig.ps1` itself. No child is spawned. Measured on the rig, this
 removes about **1120 ms per station**: one `powershell.exe` start, plus the parse of the
 21 KB `flash_device.ps1`, plus its `rig_layout.ps1` dot-source and the capture of its
 stdout. All of that wrapped a single CLI call the parent can make itself.
@@ -277,7 +277,7 @@ One station, same probe and board, measured back to back:
 | Script | Wall clock | DevEUI |
 |--------|-----------|--------|
 | Old `scan_rig.ps1` (child process per station) | 1991 ms | `0080E1150636E069` |
-| `scan_device.ps1` (in process) | 871 ms | `0080E1150636E069` |
+| `scan_rig.ps1` (in process) | 871 ms | `0080E1150636E069` |
 
 Identical DevEUI, so the copied byte order is correct.
 
@@ -706,7 +706,7 @@ The DevEUI is not assignable. It comes from the chip UID, so keys cannot be chos
 the board in the slot has been identified. That forces two phases per station:
 
 ```
-1  read DevEUI     scan_device.ps1 -Json -Stations N
+1  read DevEUI     scan_rig.ps1 -Json -Stations N
                    -> DevEUI: 0080E1150636DF36      (no erase, no reset)
 
 2  service         mint AppKey (16 B) + JoinEUI (8 B)
@@ -827,7 +827,7 @@ The probe is resolved in three steps. An explicit `-SerialNumber` wins. Otherwis
 script reads this station's row from `rig_devices.csv`. Otherwise it leaves `sn=` off and
 lets the CLI use the only attached probe.
 
-### `scan_device.ps1`
+### `scan_rig.ps1`
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
@@ -1128,7 +1128,7 @@ Read each station's `rdp1` field rather than inferring the lock from the exit co
 `-DryRun` also exits 0. **Do not read a 0 as "devices passed"** without checking whether
 the run was a dry run.
 
-### `scan_device.ps1`, read DevEUIs, writes nothing
+### `scan_rig.ps1`, read DevEUIs, writes nothing
 
 | Code | Meaning |
 |------|---------|
@@ -1257,7 +1257,7 @@ reports `rdp1: "passed"`, so a consumer reading only the JSON cannot tell that t
 still in flash. The failed erase is visible in the operator view alone. Add a `cleared`
 field to the station row if the service ever needs to gate on it.
 
-### `scan_device.ps1 -Json`
+### `scan_rig.ps1 -Json`
 
 Same envelope and the same camelCase names, so one consumer reads both. The document is
 always an object with a `stations` array plus counts. It is never a bare array. `station`,
@@ -1392,7 +1392,7 @@ These are the places where a tidy-looking change breaks the rig silently.
 | Keep `rig_layout.ps1` the only station-to-op-code map. | Two copies drift, and a device gets the wrong plan or slot. |
 | Keep AppKey and JoinEUI byte-reversed on the factory page. | `keys_update.c` reads them backwards. Natural order gives a device that provisions and never joins. |
 | Write the region at offset `0x30`. | That is the address the firmware reads. `0x0803F840` is not. |
-| Keep the DevEUI byte order identical in `flash_device.ps1` and `scan_device.ps1`. | Two copies exist because the scan reads the UID in process. A wrong order produces a plausible-looking wrong DevEUI and no error. |
+| Keep the DevEUI byte order identical in `flash_device.ps1` and `scan_rig.ps1`. | Two copies exist because the scan reads the UID in process. A wrong order produces a plausible-looking wrong DevEUI and no error. |
 | Keep the `L` suffixes on the verdict masks. | Windows PowerShell types a bare `0xD5000000` as `Int32`, which overflows to a negative value. Every comparison against a real `uint32` then fails, and every device reports a verdict timeout. |
 | Poll the verdict in `HOTPLUG` mode only. | Any reset runs SBSFU, whose `.data` starts at `0x20003400` and overwrites the verdict. |
 | Keep `$VERDICT_FAULT_NAMES` a list of pairs. | An `[ordered]@{}` indexed by an integer returns the element at that position, not the value for that key. |
@@ -1430,7 +1430,7 @@ These are the places where a tidy-looking change breaks the rig silently.
 | "no row for station 13" | `-Stations` was coerced to an integer somewhere. Pass it as a string. |
 | `SETUP FAILED: read at 0x1FFF7580 failed (exit 1)` | Probe not attached, or the serial in `rig_devices.csv` is wrong. The underlying CLI message is `Serial number not found`. Re-run with `-KeepLogs` to see it. |
 | Connect or verify failures on one station | Drop `-Freq` to 8000 or 4000. It is the first thing to try when a probe is marginal. |
-| Every station reports `no probe` | `-l` returned garbled serials. `scan_device.ps1` already falls back to direct reads. Confirm with `-c port=SWD mode=HOTPLUG`. |
+| Every station reports `no probe` | `-l` returned garbled serials. `scan_rig.ps1` already falls back to direct reads. Confirm with `-c port=SWD mode=HOTPLUG`. |
 | Scan reports a station twice | The probe list was not de-duplicated. `-l` prints each serial twice. |
 | Scan reports `read failed` on a station you believe is populated | Usually no board seated. A direct connect reports a good voltage and `No STM32 target found!`. |
 | `VERDICT TIMEOUT`, last read `0x00005776` | SBSFU has not handed over. The device did not reach the application. |
@@ -1480,14 +1480,14 @@ These are the places where a tidy-looking change breaks the rig silently.
 ### Maintenance points
 
 - **The CLI path now exists four times in the repo.** `$CLI` in `flash_device.ps1`, the
-  `-ProgrammerCli` default in `scan_device.ps1` and `release_device.ps1`, and `$CUBE_CLI`
+  `-ProgrammerCli` default in `scan_rig.ps1` and `release_device.ps1`, and `$CUBE_CLI`
   in `bless_rig.ps1`. A fifth copy lives outside the repo, in `enable_security.bat`'s
   `setenv.bat`. **That reaches the limit the repo rule set.** Move the path into
   `rig_layout.ps1`.
 - **The firmware path is hardcoded** in `flash_device.ps1` as `$FIRMWARE_IMAGE`. It now
   points at `BFU_FSO.bin` in this folder, not at the monorepo build output. Copy each new
   build here. The path is overridable per run with `-FirmwarePath`.
-- **The DevEUI byte order exists twice**, in `flash_device.ps1` and `scan_device.ps1`.
+- **The DevEUI byte order exists twice**, in `flash_device.ps1` and `scan_rig.ps1`.
   `release_device.ps1` does not report a DevEUI, so that a third copy is not needed.
 - **`rig_devices.csv` is bench-specific** and holds real probe serials. Only
   `rig_devices.example.csv` is portable.
@@ -1495,7 +1495,7 @@ These are the places where a tidy-looking change breaks the rig silently.
   columns are `SerialNumber` and `OpCode`. The code requires `SerialNumber` plus either
   `Position` or `OpCode`, and it prefers `Position`.
 - **`flash_device.ps1` does not set `Set-StrictMode`.** `bless_rig.ps1` and
-  `scan_device.ps1` both set `-Version Latest`. Keep that in mind when moving code between
+  `scan_rig.ps1` both set `-Version Latest`. Keep that in mind when moving code between
   them.
 - **The shared bring-up AppKey is a script default.** Any production path must pass
   `-Keys`. Shipping devices on a shared root key is a silent defect, and `bless_rig.ps1`

@@ -43,7 +43,7 @@ flowchart LR
 
 | Phase | What happens | Who does it |
 |-------|--------------|-------------|
-| 1. Scan | Read each device's DevEUI. Nothing is written. | `scan_device.ps1` |
+| 1. Scan | Read each device's DevEUI. Nothing is written. | `scan_rig.ps1` |
 | 2. Register | Mint keys and register them against the DevEUI. | Blessing service |
 | 3. Bless | Erase the board, write the keys, flash the firmware, reboot. | `bless_rig.ps1` |
 | 4. Self-test | The device checks its own hardware, then joins the network. | Device firmware |
@@ -70,7 +70,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 **Check the bench.** Safe at any time. Reads only.
 
 ```powershell
-.\scan_device.ps1
+.\scan_rig.ps1
 ```
 
 **Dry run.** Always do this for an unfamiliar command. Every real run erases its devices.

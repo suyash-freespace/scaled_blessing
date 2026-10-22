@@ -16,7 +16,7 @@
     exactly one station is the speed bump on an irreversible action.
 
     No child process is spawned. The CLI is called directly in this process, the same way
-    scan_device.ps1 does it, because there is nothing here to isolate or run in parallel.
+    scan_rig.ps1 does it, because there is nothing here to isolate or run in parallel.
 
     Steps:
 
@@ -31,7 +31,7 @@
 
     The DevEUI is deliberately NOT reported. Deriving it means a third copy of
     GetUniqueId()'s byte order, which already exists in flash_device.ps1 and
-    scan_device.ps1 and which the repo rules say must not be duplicated again - a wrong
+    scan_rig.ps1 and which the repo rules say must not be duplicated again - a wrong
     order yields a plausible-looking WRONG DevEUI with no error. The ST-LINK serial
     identifies the station just as well here, and it costs no read.
 
@@ -86,7 +86,7 @@ param(
 
     [int]$Freq = 24000,
 
-    # Fourth copy of this path in the repo, after flash_device.ps1, scan_device.ps1 and
+    # Fourth copy of this path in the repo, after flash_device.ps1, scan_rig.ps1 and
     # bless_rig.ps1. Overridable here so a moved install needs no edit. The repo rule is
     # to move this into rig_layout.ps1 once a fifth copy appears, and counting
     # enable_security.bat's setenv.bat, this is the fifth.

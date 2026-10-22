@@ -336,7 +336,7 @@ $FACTORY_PAGE_NUM = 127
 # character is the difference, so the value cannot be passed in.
 $RDP_LEVEL_1 = '0xBB'
 
-# Fourth copy of this path: flash_device.ps1, scan_device.ps1 and enable_security.bat's
+# Fourth copy of this path: flash_device.ps1, scan_rig.ps1 and enable_security.bat's
 # setenv.bat hold the others. Only used under -Secure. If a fifth ever appears, move it
 # into rig_layout.ps1 instead.
 $CUBE_CLI = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe"
@@ -393,7 +393,7 @@ function Invoke-CliParallel {
       Run one STM32_Programmer_CLI call per item, concurrently, and return each one's
       exit code. Used only by -Secure.
 
-      Real CLI processes rather than child powershell.exe: scan_device.ps1 measured a
+      Real CLI processes rather than child powershell.exe: scan_rig.ps1 measured a
       powershell spawn at 1120 ms per station for work that was one CLI call underneath,
       so there is no reason to pay it here either.
 
