@@ -1115,17 +1115,26 @@ if ($Json) {
     #   faults  - decoded from the verdict bits
     #   result  - prose; exitCode carries the same classification as a number
     # The terminal tables still show all three; this is the machine feed only.
+    #
+    # verdictProduct IS included: the product that wrote the word (Get-VerdictProduct), so a
+    # consumer can name a wrong-firmware board without a second copy of the decode.
     $doc = [pscustomobject]@{
         stations = @($summary | Sort-Object Station | ForEach-Object {
             # Always present, so the consumer never branches on a conditional schema.
             # 'not requested' when -Secure was off; see the securing block above.
             $r = 'not requested'
             if ($Secure -and $secureByStation.ContainsKey($_.Station)) { $r = $secureByStation[$_.Station] }
+            # 'FSO', 'TIM', or $null when the word is missing or not a verdict.
+            $vp = $null
+            if ($_.Verdict) {
+                try { $vp = Get-VerdictProduct -Word ([Convert]::ToUInt32($_.Verdict, 16)) } catch { $vp = $null }
+            }
             [pscustomobject]@{
                 station      = $_.Station
                 serialNumber = $_.SerialNumber
                 devEui       = $_.DevEUI
                 verdict      = $_.Verdict
+                verdictProduct = $vp
                 exitCode     = $_.Exit
                 passed       = $_.Passed
                 killed       = $_.Killed
